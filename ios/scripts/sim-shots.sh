@@ -19,7 +19,8 @@ fi
 # Before the build, so being refused doesn't come after minutes of compiling.
 scripts/sim.sh boot >/dev/null
 DD=/tmp/threadbear-dd-$SIM
-xcodebuild -project Threadbear.xcodeproj -scheme Threadbear -configuration Debug -destination "id=$SIM" \
+# One Threadbear build at a time on this machine (scripts/one-build.sh).
+../scripts/one-build.sh xcodebuild -project Threadbear.xcodeproj -scheme Threadbear -configuration Debug -destination "id=$SIM" \
   -derivedDataPath "$DD" build | grep -E " error:|BUILD (SUCCEEDED|FAILED)"
 xcrun simctl ui "$SIM" appearance "$([[ "${2:-}" == --dark ]] && echo dark || echo light)"
 xcrun simctl status_bar "$SIM" override --time 9:41 --batteryLevel 100 --batteryState charged --cellularBars 4
@@ -41,6 +42,12 @@ shot approval -ThreadbearOpen a1
 shot question -ThreadbearOpen a2
 shot reply -ThreadbearOpen a3
 shot running -ThreadbearOpen a5
+shot december -ThreadbearOpen a5 -ThreadbearBearDate 2026-12-24T12:00
+shot dictating -ThreadbearOpen a3 -ThreadbearDictating
+shot typing-out -ThreadbearOpen a3 -ThreadbearTypingOut
+shot slash-commands -ThreadbearOpen a3 -ThreadbearDraft /co
+shot typed-out -ThreadbearOpen a3 -ThreadbearTypedOut
+shot heard-live -ThreadbearOpen a3 -ThreadbearHeardLive
 shot pictures -ThreadbearPictures -ThreadbearOpen pics
 shot new-thread -ThreadbearCompose "Add a dark mode to the garden planner, matching the system setting"
 shot pair --unpaired

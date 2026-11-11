@@ -12,7 +12,8 @@
 // disk for when the backend can't be reached), and sends only its own,
 // each run taken with a claim first so it's sent once.
 import { experimentOn } from './experiments.ts';
-import { type KeptCheck, CHECK_TIMEOUT_MS, checkLimitMs, checkOutcome, checkRunningElsewhere, clearCheckRunning, dropKeptCheck, keepCheck, markCheckRunning, MAX_CHECK_CHARS, MAX_CHECK_TIMEOUT_SECS, readKeptCheck, runCheck, type CheckResult } from './schedule-check.ts';
+import type { CheckCard } from './patch-trust.ts';
+import { type KeptCheck, CHECK_TIMEOUT_MS, checkLimitMs, checkOutcome, checkRunningElsewhere, clearCheckRunning, dropKeptCheck, HELD_EXTRA, HELD_SKIP, heldToldAbout, keepCheck, markCheckRunning, MAX_CHECK_CHARS, MAX_CHECK_TIMEOUT_SECS, noteHeldTold, readKeptCheck, runCheck, type CheckResult } from './schedule-check.ts';
 import { forbiddenText } from './sync.ts';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,10 +26,12 @@ import { EFFORT_LEVELS, ErrorCode, RpcError, isEffortLevel } from './protocol.ts
 import { atomicWriteFileSync, isDirectory, readJsonSync } from './fsutil.ts';
 import { expandHome } from './config.ts';
 import { CronError, checkZone, describeAt, describeCron, localZone, nextRun, nextRuns, parseCron } from './cron.ts';
+import { cutSafely, firstLineSafely } from './safe-cut.ts';
 
 // What a check printed, carried by a run: kept (when it was kept) and the
 // command, so a sent run drops that command's kept file.
-type Carried = { extra: string; kept?: string; check?: string };
+// `held`: it says a check wasn't run, for this digest of what it'd run.
+type Carried = { extra: string; kept?: string; check?: string; held?: string };
 
 // What schedules.json holds for each: everything but whenText, which is
 // worked out when it's sent, and runnerName, from the backend's runners.
@@ -93,6 +96,23 @@ export type ScheduleBackend = {
   runners(): Promise<BackendRunner[]>;
 };
 
+// A run this runner sent (or skipped, or couldn't send) that the backend
+// hasn't heard of yet: ran()'s arguments, when it was first tried, and for a
+// due run the nextRunAt it was due at (`slot`).
+type RanParams = Parameters<ScheduleBackend['ran']>[0];
+type UnrecordedRun = RanParams & { since: number; slot?: string };
+// What only this process keeps about one: how often it's been tried, whether
+// that's been warned of, and whether the backend has said yes (it's
+// forgotten once a row shows it, as a yes can come with the row edited).
+type HeldRun = UnrecordedRun & { tries?: number; warned?: boolean; acked?: boolean };
+const runKey = (r: RanParams) => `${r.scheduleId}\n${r.lastRun.at}\n${r.lastRun.outcome}\n${r.lastRun.threadId ?? ''}`;
+// The same run: two can share a millisecond (a run now straight after one
+// that failed), so the time alone doesn't say.
+const sameRun = (a: Schedule['lastRun'], b: NonNullable<Schedule['lastRun']>) => !!a && a.at === b.at && a.outcome === b.outcome && a.threadId === b.threadId;
+// Still not recorded after this long, it's said as a warning (it reaches
+// Sentry); a blip that a retry gets past is only logged.
+const UNRECORDED_WARN_MS = 30 * 60_000;
+
 // A runner the backend hasn't heard from for this long shows as offline,
 // as on the phone.
 const ONLINE_MS = 3 * 60_000;
@@ -100,9 +120,11 @@ const ONLINE_MS = 3 * 60_000;
 // offered in runners.list: an old install, or a test's.
 const FORGET_MS = 30 * 86_400_000;
 
-export type ScheduleRunner = Pick<Runner, 'create' | 'send' | 'get' | 'hello' | 'onNotification' | 'publish'>;
+export type ScheduleRunner = Pick<Runner, 'create' | 'send' | 'get' | 'hello' | 'onNotification' | 'publish' | 'patchTrust'> & { cfg?: Pick<Runner['cfg'], 'defaults'> };
 
 export type CreateScheduleParams = {
+  // A card's approval of `check` (patch-trust.ts, approveCheck). Not from a client.
+  checkCard?: CheckCard;
   text: string;
   title?: string;
   at?: string;
@@ -142,6 +164,7 @@ export type UpdateScheduleParams = {
   permissionMode?: PermissionMode;
   // null or "" takes the check off.
   check?: string | null;
+  checkCard?: CheckCard;
   // null: back to a minute.
   checkTimeoutSecs?: number | null;
 };
@@ -151,6 +174,8 @@ export type UpdateScheduleParams = {
 const TICK_MS = 30_000;
 // A one-off that has run stays in the list this long, then goes.
 const KEEP_FINISHED_MS = 7 * 86_400_000;
+// How soon a save that failed is tried again.
+export const SAVE_RETRY_MS = 5000;
 const BUSY = new Set(['starting', 'running', 'waiting']);
 
 export class Scheduler {
@@ -161,6 +186,8 @@ export class Scheduler {
   private zone: () => string;
   private items = new Map<string, ScheduleRecord>();
   private timer?: TimerHandle;
+  private saveRetry?: TimerHandle;
+  private saveFailed = false;
   private stopped = false;
   private unlisten?: () => void;
   // This runner, as the backend knows it (sync.runnerId and its name).
@@ -202,6 +229,19 @@ export class Scheduler {
   private memKept = new Map<string, KeptCheck>();
   // Schedules whose check this process has under way.
   private checkingNow = new Set<string>();
+  // Runs sent here that the backend hasn't recorded yet, by runKey, oldest
+  // first, and on disk (runsDir) for the next runner process. Until it
+  // has, its row still says the run is due, and once the claim lapses
+  // (2 minutes) that run would be sent again: THREADBEAR-15 (9 Nov), a
+  // daily schedule sent twice when the M5's network dropped as it told the
+  // backend and a self-update's new runner read the row 5 minutes later.
+  // Each is laid over its row (overlayUnrecorded) and tried again every tick
+  // until it lands.
+  private unrecorded = new Map<string, HeldRun>();
+  private recording = new Set<string>();
+  // One file a run, so two runner processes in a handover never write over
+  // each other's (a list in one file would need a lock).
+  private runsDir: string;
 
   constructor(deps: {
     runner: ScheduleRunner;
@@ -223,6 +263,7 @@ export class Scheduler {
     this.syncOn = deps.syncOn ?? false;
     this.elsewhere = deps.elsewhere ?? (() => false);
     this.file = path.join(deps.home, 'schedules.json');
+    this.runsDir = path.join(deps.home, 'schedule-runs');
     this.clock = deps.clock;
     this.log = deps.log;
     this.zone = deps.zone ?? localZone;
@@ -258,7 +299,8 @@ export class Scheduler {
       }
       if (gone) this.changed();
     });
-    this.log.info('schedules loaded', { count: this.items.size, mode: this.mode });
+    for (const r of this.readRuns()) this.unrecorded.set(runKey(r), r);
+    this.log.info('schedules loaded', { count: this.items.size, mode: this.mode, ...(this.unrecorded.size ? { unrecordedRuns: this.unrecorded.size } : {}) });
     this.tick();
   }
 
@@ -293,6 +335,7 @@ export class Scheduler {
   stop(): void {
     this.stopped = true;
     this.timer?.cancel();
+    this.saveRetry?.cancel();
     this.unlisten?.();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
@@ -391,12 +434,19 @@ export class Scheduler {
 
   private onRows(rows: StoredSchedule[]): void {
     if (this.stopped) return;
+    const before = new Map(this.items);
     this.items.clear();
     for (const r of rows) {
       const { whenText: _w, ...rec } = r;
+      // Another schedule under the same id (gone and made again, or moved
+      // to another runner): what the old one's check printed isn't this
+      // one's to send (stillClaimed).
+      const was = before.get(rec.id);
+      if (was && (was.createdAt !== rec.createdAt || was.runnerId !== rec.runnerId)) this.dropKept(rec.id);
       this.items.set(rec.id, rec);
       if (!this.names.has(rec.runnerId)) this.namesDue = true;
     }
+    this.overlayUnrecorded();
     if (this.namesDue) void this.refreshNames();
     this.changed();
     this.tick();
@@ -546,7 +596,7 @@ export class Scheduler {
     const now = this.iso();
     const rec: ScheduleRecord = {
       id: crypto.randomUUID(),
-      title: p.title?.trim() ? p.title.trim().slice(0, 200) : firstLine(text),
+      title: p.title?.trim() ? cutSafely(p.title.trim(), 200) : firstLine(text),
       text,
       paused: Boolean(p.paused),
       createdAt: now,
@@ -581,6 +631,7 @@ export class Scheduler {
     if (p.createdBy) rec.createdBy = p.createdBy;
     if (this.mode === 'backend') rec.runnerId = runnerId;
     this.plan(rec);
+    if (!away) this.approveCheck(rec, p.checkCard);
     await this.put(rec);
     // An `at` that's already passed runs now rather than on the next tick.
     this.tick();
@@ -603,7 +654,7 @@ export class Scheduler {
     const rec: ScheduleRecord = structuredClone(this.mustGet(p.scheduleId));
     const away = !this.mine(rec);
     let replan = false;
-    if (p.title !== undefined) rec.title = p.title.trim() ? p.title.trim().slice(0, 200) : firstLine(rec.text);
+    if (p.title !== undefined) rec.title = p.title.trim() ? cutSafely(p.title.trim(), 200) : firstLine(rec.text);
     if (p.text !== undefined) {
       if (!p.text.trim()) throw bad('text cannot be empty');
       rec.text = p.text.trim();
@@ -641,6 +692,7 @@ export class Scheduler {
       if (p.checkTimeoutSecs === null) delete rec.checkTimeoutSecs;
       else rec.checkTimeoutSecs = checkedTimeout(p.checkTimeoutSecs);
     }
+    const moved = !rec.threadId && p.cwd !== undefined;
     if (!rec.threadId) {
       if (p.cwd !== undefined) rec.cwd = away ? p.cwd.trim() || undefined : this.checkedFolder(p.cwd);
       if (rec.cwd === undefined) delete rec.cwd;
@@ -664,6 +716,9 @@ export class Scheduler {
     }
     rec.updatedAt = this.iso();
     if (replan) this.plan(rec);
+    // Passing the check again, or moving it, approves it as it is now. Any
+    // other change leaves its approval alone.
+    if (!away && (p.check !== undefined || moved)) this.approveCheck(rec, p.checkCard);
     await this.put(rec);
     this.tick();
     return this.view(rec);
@@ -704,28 +759,165 @@ export class Scheduler {
     this.notMidCheck(rec);
     const res = this.send(rec, true, this.keptFor(rec));
     if (res.outcome !== 'sent') throw new RpcError(ErrorCode.other, res.note ?? "Couldn't run it.");
+    // A one-off run now has used its time: that slot isn't due again.
+    const slot = rec.at ? rec.nextRunAt : undefined;
     if (rec.at) this.finish(rec);
-    if (this.mode === 'backend') await this.recordRun(rec, true);
+    if (this.mode === 'backend') await this.recordRun(rec, true, undefined, slot);
     this.changed();
     return { schedule: this.view(rec), threadId: res.threadId!, turnId: res.turnId! };
   }
 
   // Tells the backend about a run this runner sent (or skipped, or
-  // couldn't send), with the schedule's next time. Best effort: a run that
-  // was sent stays sent.
-  private async recordRun(rec: ScheduleRecord, sent: boolean, request?: string): Promise<void> {
+  // couldn't send), with the schedule's next time. A run that was sent
+  // stays sent; one the backend can't be told of yet is written down first
+  // and tried again until it lands (`unrecorded` says why).
+  // `slot`: the nextRunAt a due run was claimed at.
+  private async recordRun(rec: ScheduleRecord, sent: boolean, request?: string, slot?: string): Promise<void> {
     if (!this.backend || !rec.lastRun) return;
-    await this.backend
-      .ran({
-        scheduleId: rec.id,
-        lastRun: rec.lastRun,
-        sent,
-        expectUpdatedAt: rec.updatedAt,
-        ...(rec.nextRunAt ? { nextRunAt: rec.nextRunAt } : {}),
-        ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
-        ...(request ? { request } : {}),
-      })
-      .catch((e) => this.log.warn('could not record a schedule run in the backend', { scheduleId: rec.id, error: String(e) }));
+    const run: UnrecordedRun = {
+      scheduleId: rec.id,
+      lastRun: { ...rec.lastRun },
+      sent,
+      expectUpdatedAt: rec.updatedAt,
+      ...(rec.nextRunAt ? { nextRunAt: rec.nextRunAt } : {}),
+      ...(rec.finishedAt ? { finishedAt: rec.finishedAt } : {}),
+      ...(request ? { request } : {}),
+      since: this.clock.now(),
+      ...(slot ? { slot } : {}),
+    };
+    this.unrecorded.set(runKey(run), run);
+    // On disk before it's sent: if this process goes before the backend
+    // answers, the next one still knows the run happened.
+    this.saveRun(run);
+    await this.recordRuns(rec.id);
+  }
+
+  // Tells the backend about a schedule's unrecorded runs, oldest first,
+  // stopping at the first that fails (tried again next tick).
+  private async recordRuns(scheduleId: string): Promise<void> {
+    const backend = this.backend;
+    if (!backend) return;
+    for (const [key, run] of [...this.unrecorded]) {
+      if (run.scheduleId !== scheduleId || run.acked) continue;
+      // Already being told (a run now while a tick is at it): in order, so
+      // the rest wait for it too.
+      if (this.recording.has(key)) return;
+      this.recording.add(key);
+      try {
+        const { since: _s, slot: _sl, tries: _t, warned: _w, acked: _a, ...p } = run;
+        await backend.ran(p);
+        // A yes for what was sent: if an edit came in meanwhile and the run
+        // took its updatedAt (overlayUnrecorded), it's told again with that.
+        if (run.expectUpdatedAt === p.expectUpdatedAt) run.acked = true;
+        if (run.tries) this.log.info('recorded a schedule run in the backend after retrying', { scheduleId, tries: run.tries });
+      } catch (e) {
+        run.tries = (run.tries ?? 0) + 1;
+        const late = this.clock.now() - run.since > UNRECORDED_WARN_MS;
+        if (late && !run.warned) {
+          run.warned = true;
+          this.log.warn('a schedule run still is not recorded in the backend', { scheduleId, tries: run.tries, error: String(e) });
+        } else if (run.tries === 1) this.log.info('could not record a schedule run in the backend yet; trying again', { scheduleId, error: String(e) });
+        return;
+      } finally {
+        this.recording.delete(key);
+      }
+    }
+  }
+
+  // Each unrecorded run laid over its row as the backend will have it once
+  // told: its last run, its count and its next time, so the row a
+  // subscription (or the next runner) brings back doesn't make it due again.
+  // It's forgotten once the row shows it recorded and past its slot (or a
+  // later run), or the schedule has gone, or gone to another runner.
+  // A row edited elsewhere (another Mac's rename) while the run was out
+  // has a new updatedAt, so scheduleRan won't take the run's next time; if
+  // it still says the slot that ran, the run takes that updatedAt and is
+  // told again (Codex's review). scheduleRan counts a run it has once.
+  private overlayUnrecorded(): void {
+    for (const [key, run] of [...this.unrecorded]) {
+      const rec = this.items.get(run.scheduleId);
+      if (!rec || !this.mine(rec) || (rec.lastRun && rec.lastRun.at > run.lastRun.at)) {
+        this.forgetRun(key);
+        continue;
+      }
+      const recorded = sameRun(rec.lastRun, run.lastRun);
+      const stale = run.slot !== undefined && rec.nextRunAt === run.slot && !rec.paused;
+      if ((recorded || run.acked) && !stale) {
+        this.forgetRun(key);
+        continue;
+      }
+      if (stale && rec.updatedAt !== run.expectUpdatedAt) {
+        run.expectUpdatedAt = rec.updatedAt;
+        run.acked = false;
+        this.saveRun(run);
+      } else if (stale && run.acked) run.acked = false;
+      if (!recorded) {
+        rec.lastRun = { ...run.lastRun };
+        if (run.sent) rec.runs += 1;
+      }
+      if (run.request !== undefined && rec.runRequestedAt === run.request) delete rec.runRequestedAt;
+      // As scheduleRan does: a change since worked out its own next time.
+      if (rec.updatedAt === run.expectUpdatedAt) {
+        if (run.nextRunAt) rec.nextRunAt = run.nextRunAt;
+        else delete rec.nextRunAt;
+        if (run.finishedAt) rec.finishedAt = run.finishedAt;
+      }
+    }
+  }
+
+  // Whether this slot of a schedule has already run here, waiting to be
+  // recorded: it's never claimed again.
+  private slotRan(scheduleId: string, slot: string): boolean {
+    for (const r of this.unrecorded.values()) if (r.scheduleId === scheduleId && r.slot === slot) return true;
+    return false;
+  }
+
+  private hasUnrecorded(scheduleId: string): boolean {
+    for (const r of this.unrecorded.values()) if (r.scheduleId === scheduleId) return true;
+    return false;
+  }
+
+  private forgetRun(key: string): void {
+    if (!this.unrecorded.delete(key)) return;
+    try {
+      fs.rmSync(this.runFile(key), { force: true });
+    } catch (e) {
+      // Left behind, it's dropped by the next runner once it sees the row.
+      this.log.warn('could not remove a recorded schedule run', { error: String(e) });
+    }
+  }
+
+  private runFile(key: string): string {
+    return path.join(this.runsDir, `${crypto.createHash('sha256').update(key).digest('hex').slice(0, 32)}.json`);
+  }
+
+  private saveRun(run: HeldRun): void {
+    const { tries: _t, warned: _w, acked: _a, ...r } = run;
+    try {
+      fs.mkdirSync(this.runsDir, { recursive: true });
+      atomicWriteFileSync(this.runFile(runKey(r)), `${JSON.stringify(r)}\n`);
+    } catch (e) {
+      // Still held here, so this process won't send it again.
+      this.log.warn('could not save a schedule run waiting to be recorded', { scheduleId: r.scheduleId, error: String(e) });
+    }
+  }
+
+  // Oldest first, as they're told to the backend in that order.
+  private readRuns(): UnrecordedRun[] {
+    let names: string[];
+    try {
+      names = fs.readdirSync(this.runsDir).filter((n) => n.endsWith('.json'));
+    } catch {
+      return [];
+    }
+    const runs: UnrecordedRun[] = [];
+    for (const n of names) {
+      const r = readJsonSync<UnrecordedRun>(path.join(this.runsDir, n));
+      const ok =
+        !!r && typeof r.scheduleId === 'string' && typeof r.lastRun?.at === 'string' && typeof r.lastRun?.outcome === 'string' && typeof r.sent === 'boolean' && typeof r.expectUpdatedAt === 'string' && typeof r.since === 'number';
+      if (ok) runs.push(r);
+    }
+    return runs.sort((a, b) => a.lastRun.at.localeCompare(b.lastRun.at));
   }
 
   // ------------------------------------------------------------------ runs
@@ -810,8 +1002,10 @@ export class Scheduler {
           this.dropKept(rec.id);
           continue;
         }
+        if (this.hasUnrecorded(rec.id)) await this.recordRuns(rec.id);
         if (rec.runRequestedAt) await this.runRequested(backend, rec);
         if (rec.paused || !rec.nextRunAt || Date.parse(rec.nextRunAt) > now) continue;
+        if (this.slotRan(rec.id, rec.nextRunAt)) continue;
         const claimed = await backend.claim(rec.id, 'due', rec.nextRunAt).catch((e) => {
           this.log.warn('could not claim a schedule run', { scheduleId: rec.id, error: String(e) });
           return false;
@@ -820,24 +1014,19 @@ export class Scheduler {
         // The record as it is now: the subscription may have brought a
         // newer one (its check changed) or none (deleted, maybe by another
         // runner) while the claim was out, and again while it checked.
-        const fresh = this.items.get(rec.id);
-        if (!fresh) {
-          this.dropKept(rec.id);
-          continue;
-        }
+        const fresh = this.stillClaimed(backend, rec);
+        if (!fresh) continue;
         rec = fresh;
         const checked = await this.checked(rec);
         if (this.stopped) continue;
-        const after = this.items.get(rec.id);
-        if (!after) {
-          this.dropKept(rec.id);
-          continue;
-        }
+        const after = this.stillClaimed(backend, rec);
+        if (!after) continue;
         rec = after;
         if (checked === 'later') {
           await backend.release(rec.id).catch(() => {});
           continue;
         }
+        const slot = rec.nextRunAt;
         const res = this.send(rec, false, checked);
         if (res.outcome === 'retry') {
           await backend.release(rec.id).catch(() => {});
@@ -845,7 +1034,7 @@ export class Scheduler {
         }
         if (rec.at) this.finish(rec);
         else this.plan(rec);
-        await this.recordRun(rec, res.outcome === 'sent');
+        await this.recordRun(rec, res.outcome === 'sent', undefined, slot);
       }
       this.changed();
     } finally {
@@ -872,8 +1061,9 @@ export class Scheduler {
     const request = row.runRequestedAt!;
     const claimed = await backend.claim(row.id, 'request', request).catch(() => false);
     if (!claimed || this.stopped) return;
-    // As it is now (backendTick says why): deleted meanwhile, it isn't sent.
-    const rec = this.items.get(row.id);
+    // As it is now (backendTick says why): deleted meanwhile, or no longer
+    // the one claimed, it isn't sent.
+    const rec = this.stillClaimed(backend, row);
     if (!rec) return;
     let res: ReturnType<Scheduler['send']>;
     try {
@@ -888,9 +1078,32 @@ export class Scheduler {
       }
       throw e;
     }
+    const slot = res.outcome === 'sent' && rec.at ? rec.nextRunAt : undefined;
     if (res.outcome === 'sent' && rec.at) this.finish(rec);
     delete rec.runRequestedAt;
-    await this.recordRun(rec, res.outcome === 'sent', request);
+    await this.recordRun(rec, res.outcome === 'sent', request, slot);
+  }
+
+  // The schedule a claim was taken for, as the subscription has it now, or
+  // undefined when that one isn't there to send any more: deleted, moved to
+  // another runner, or a different schedule under the same id. The claim
+  // was the backend saying this runner may send that row; a row that came in
+  // under its id meanwhile wasn't claimed. Daybreak's finding (6 Nov): the
+  // owner deletes a schedule while its check runs, a runner key saves one
+  // of its own under the gone id (same check, its own text, Full access),
+  // and the main Mac's subscription, which has every runner's rows, handed
+  // the new row to send() in place of the claimed one. So it must still be
+  // this runner's (only the owner key or this runner's own can write a row
+  // with our runnerId) and the same schedule (createdAt, which update
+  // keeps). Its kept check output went with the old one (onRows).
+  private stillClaimed(backend: ScheduleBackend, claimed: ScheduleRecord): ScheduleRecord | undefined {
+    const now = this.items.get(claimed.id);
+    if (now && this.mine(now) && now.createdAt === claimed.createdAt) return now;
+    // Let go, in case the claim is still on a row of ours (moved away keeps
+    // it): only the holder's is cleared.
+    if (now) void backend.release(claimed.id).catch(() => {});
+    else this.dropKept(claimed.id);
+    return undefined;
   }
 
   // Its check, when it has one and checks are on (schedule-check.ts):
@@ -899,14 +1112,7 @@ export class Scheduler {
   // process, or the check was changed while it ran).
   private async checked(rec: ScheduleRecord): Promise<{ skip: string } | Carried | 'later' | undefined> {
     if (!rec.check || !this.checksOn()) return undefined;
-    let cwd = rec.cwd ? path.resolve(expandHome(rec.cwd)) : this.home;
-    if (rec.threadId) {
-      try {
-        cwd = this.runner.get(rec.threadId).cwd;
-      } catch {
-        // A thread that's gone: send says so.
-      }
-    }
+    const cwd = this.checkFolder(rec);
     // What it printed last time and no run has carried yet (a restart
     // refused the send, or the runner stopped mid-check): send that rather
     // than asking again, as a check that keeps state won't print it twice.
@@ -916,6 +1122,12 @@ export class Scheduler {
     const kept = this.keptFor(rec);
     if (kept) return kept;
     if (checkRunningElsewhere(this.home, id, this.clock.now())) return 'later';
+    // Approved once, it runs unattended from then on, so it must still be
+    // what was approved: the command, in this folder, reaching these bytes.
+    // Read afresh now. What's in a row isn't enough, as the backend's row
+    // says what to run but only this runner's own store says it was approved.
+    const hold = this.heldCheck(command, cwd, id);
+    if (hold) return hold;
     try {
       markCheckRunning(this.home, id, this.clock.now(), timeoutMs);
     } catch {
@@ -963,6 +1175,51 @@ export class Scheduler {
     }
   }
 
+  // Where a check runs: its thread's folder, its own, or the runner's.
+  private checkFolder(rec: ScheduleRecord): string {
+    if (rec.threadId) {
+      try {
+        return this.runner.get(rec.threadId).cwd;
+      } catch {
+        // A thread that's gone: send says so.
+      }
+    }
+    return rec.cwd ? path.resolve(expandHome(rec.cwd)) : this.home;
+  }
+
+  // Binds a schedule's check to what it runs as this is called, in this
+  // runner's own store: making or changing one is what approves it (a thread
+  // that asks first has had its card by now, threadbear-mcp.ts). A failure
+  // only means the check is held at its next run.
+  private approveCheck(rec: ScheduleRecord, card?: CheckCard): void {
+    if (!rec.check) return;
+    try {
+      this.runner.patchTrust.approveCheck(rec.check, this.checkFolder(rec), card);
+    } catch (e) {
+      // A card's approval that doesn't hold changes nothing.
+      if (card) throw bad(e instanceof Error ? e.message : String(e));
+      this.log.warn("could not approve a schedule's check", { scheduleId: rec.id, error: String(e) });
+    }
+  }
+
+  // What to do instead of running a check that isn't approved as it is now,
+  // or undefined when it is. Said once per version of what it runs, on the
+  // run that's sent with it (see send), then skipped: a failed check going
+  // quiet would be worse, and an agent every five minutes no better. A folder
+  // that's gone counts, as the check would run somewhere else (runCheck).
+  private heldCheck(command: string, cwd: string, id: string): { skip: string } | Carried | undefined {
+    let hash: string;
+    try {
+      const v = this.runner.patchTrust.checkApproved(command, cwd);
+      if (v.approved && fs.existsSync(cwd)) return undefined;
+      hash = v.hash;
+    } catch (e) {
+      hash = `unreadable: ${String(e)}`;
+    }
+    if (heldToldAbout(this.home, id) === hash) return { skip: HELD_SKIP };
+    return { extra: HELD_EXTRA, held: hash };
+  }
+
   // Run now doesn't run the check, but sends what it kept and no thread
   // has seen, rather than leaving it to a next run a one-off won't have.
   private keptFor(rec: ScheduleRecord): Carried | undefined {
@@ -1003,6 +1260,14 @@ export class Scheduler {
       if (outcome === 'sent' && checked && 'extra' in checked && checked.check) {
         this.delivered.add(`${rec.id}\n${checked.check}\n${checked.kept}`);
         this.dropKept(rec.id, checked.check);
+      }
+      if (outcome === 'sent' && checked && 'extra' in checked && checked.held) {
+        try {
+          noteHeldTold(this.home, rec.id, checked.held);
+        } catch (e) {
+          // Told again next run, rather than not told.
+          this.log.warn('could not note that a held check was told about', { scheduleId: rec.id, error: String(e) });
+        }
       }
       this.log.info('schedule ran', { scheduleId: rec.id, outcome, threadId, note });
     };
@@ -1100,14 +1365,28 @@ export class Scheduler {
   // -------------------------------------------------------------- helpers
 
   private changed(): void {
+    this.save();
+    this.publish();
+  }
+
+  // A save that fails is tried again in a moment, as Runner.flush does for
+  // threads, rather than waiting for the next change: until it lands a
+  // restart brings back the old list, so a deleted schedule could fire again
+  // (THREADBEAR-1R: the cloud box's disk filled).
+  private save(): void {
+    this.saveRetry?.cancel();
+    this.saveRetry = undefined;
     const stored = [...this.items.values()];
     const version = this.mode === 'backend' ? 2 : 1;
     try {
       atomicWriteFileSync(this.file, `${JSON.stringify({ version, schedules: stored }, null, 2)}\n`);
+      this.saveFailed = false;
     } catch (e) {
-      this.log.error('could not save schedules', { error: String(e) });
+      // Said once until it saves, as it reaches Sentry.
+      if (!this.saveFailed) this.log.error('could not save schedules', { error: String(e) });
+      this.saveFailed = true;
+      if (!this.stopped) this.saveRetry = this.clock.setTimeout(() => this.save(), SAVE_RETRY_MS);
     }
-    this.publish();
   }
 
   private publish(): void {
@@ -1116,6 +1395,13 @@ export class Scheduler {
 
   private view(rec: ScheduleRecord): Schedule {
     const v: Schedule = { ...rec, whenText: this.whenText(rec) };
+    // What one with no mode of its own runs with, as new-threads.ts picks it
+    // when it runs: so raising it is checked against that, not a guess of
+    // full (Daybreak, 10 Nov: on an Ask-default runner, an Ask thread set
+    // one to Auto as if lowering it). Only this runner's default is known.
+    const defaults = this.runner.cfg?.defaults;
+    if (!rec.threadId && !rec.permissionMode && this.mine(rec) && defaults) v.defaultMode = defaults.permissionMode ?? 'full';
+    else delete v.defaultMode;
     if (rec.runnerId) {
       const own = rec.runnerId === this.self.id;
       const name = own ? this.self.name : this.names.get(rec.runnerId);
@@ -1196,7 +1482,7 @@ function bad(message: string): RpcError {
 }
 
 function firstLine(text: string): string {
-  return (text.split('\n').map((l) => l.trim()).find(Boolean) ?? 'Scheduled message').slice(0, 80);
+  return firstLineSafely(text, 80) || 'Scheduled message';
 }
 
 function checkedTimeout(secs: number): number {
@@ -1236,6 +1522,7 @@ export function scheduleMethods(s: Scheduler): Record<string, (p: Record<string,
         effort: effort(p.effort) ?? undefined,
         permissionMode: mode(p.permissionMode),
         check: str(p, 'check'),
+        ...checkCardOf(p),
         checkTimeoutSecs: num(p, 'checkTimeoutSecs'),
         paused: bool(p, 'paused'),
         createdBy: str(p, 'createdBy'),
@@ -1257,6 +1544,7 @@ export function scheduleMethods(s: Scheduler): Record<string, (p: Record<string,
       if (p.permissionMode !== undefined) upd.permissionMode = mode(p.permissionMode);
       if (p.paused !== undefined) upd.paused = bool(p, 'paused');
       if (p.check !== undefined) upd.check = p.check === null ? null : str(p, 'check');
+      Object.assign(upd, checkCardOf(p));
       if (p.checkTimeoutSecs !== undefined) upd.checkTimeoutSecs = p.checkTimeoutSecs === null ? null : num(p, 'checkTimeoutSecs');
       return { schedule: await s.update(upd) };
     },
@@ -1268,6 +1556,17 @@ export function scheduleMethods(s: Scheduler): Record<string, (p: Record<string,
       return s.preview({ cron: str(p, 'cron'), at: str(p, 'at'), timezone: str(p, 'timezone'), count: count as number | undefined });
     },
   };
+}
+
+// A card's approval passing through from a draining runner's tool call
+// (handover.ts). It can only refuse more: leaving it out approves as things
+// are, which is what the app and tb do.
+function checkCardOf(p: Record<string, unknown>): { checkCard?: CheckCard } {
+  const c = p.checkCard;
+  if (c === undefined || c === null) return {};
+  if (typeof c !== 'object') throw bad('checkCard must be an object');
+  const { hash, folder } = c as { hash?: unknown; folder?: unknown };
+  return { checkCard: { ...(typeof hash === 'string' ? { hash } : {}), ...(typeof folder === 'string' ? { folder } : {}) } };
 }
 
 function str(p: Record<string, unknown>, k: string): string | undefined {

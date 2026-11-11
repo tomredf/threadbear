@@ -472,6 +472,9 @@ all meet. So:
 - Change the backend so it still takes what the old runner sends and still
   returns what the old phone reads (new fields optional, nothing removed or
   renamed), and only later stop accepting the old shape.
+- Since API 67 `sync:heartbeat` takes `followProblem`, a runner's word that it
+  can't follow GitHub's main (docs/dev-tools.md); the main key reads it from
+  `sync:otherRunnersList`.
 - `convex/version.ts` has `API_VERSION`, returned by `sync:heartbeat` and
   `phone:me`. Bump it when a client starts relying on something new, along
   with `BACKEND_API_VERSION` in `runner/src/sync.ts` (a unit test keeps them
@@ -488,7 +491,10 @@ function takes `token` (a phone token from `tokens:issue`) and throws
 
 Queries:
 
-- `phone:me({ token })` → `{ name, expiresAt }`.
+- `phone:me({ token })` → `{ name, expiresAt, apiVersion, pushOff? }`.
+  `pushOff` is true when this backend can't send notifications (a
+  self-hosted one, docs/self-hosting.md); the phone's Settings says so in
+  place of the Notify me picker.
 - `phone:runners({ token })` → `[{ runnerId, name, version, lastSeenAt,
   draining }]`. Offline is `lastSeenAt` older than 3 minutes (a runner
   that stopped for good has `lastSeenAt` of 1970).
@@ -504,8 +510,11 @@ Queries:
   picked for Mike once he's placed it.
 - `phone:wakes({ token })` (API 45) → `[{ scheduleId, threadId?, nextRunAt? }]`,
   a small row per active schedule, from `scheduleWakes`: what a sidebar needs
-  all the time. `phone:schedules` costs about 150 KB and re-runs on every claim
-  and run, so it's for a schedules view that's open.
+  all the time: the website's sidebar, and the iPhone's inbox (from the app
+  after 1.0.4; older ones, and any on a backend before 45, follow
+  `phone:schedules`). `phone:schedules` costs about 200 KB and re-runs on every
+  claim and run, so it's for a schedules view that's open. Kept open by the
+  phone's inbox it was about 10 MB of Database I/O a day (7 Nov).
 - `phone:runnerStats({ token })` (API 45) → each runner's machine figures, last
   reported while someone was watching, and `phone:watchRunners({ token })` says
   someone is (docs/protocol.md, Sync, "Runner figures").
@@ -522,7 +531,7 @@ Queries:
   follow-ups, for the done card. `needs` (`you` | `nothing`),
   `pendingReviews` and `waitingForRoom` (`{ until, accountId? }`) (API 15)
   are what the phone needs to sort threads into the Mac sidebar's
-  sections: with `phone:schedules` it puts an idle thread a schedule will
+  sections: with `phone:wakes` it puts an idle thread a schedule will
   message under Hibernating, by the same rules as app ThreadSections. `pendingApproval`
   (from step 2) is `{ approvalId, kind: "approval", name, title, options:
   ("allow" | "allowAlways" | "deny")[], inputSummary? }` or `{ approvalId,
@@ -540,13 +549,19 @@ Queries:
   oldest message the phone has is newer than that, there's more to load.
 - `phone:messages({ token, threadId, beforeSeq?, limit?, tools? })` (since
   API 2, 28 Oct) → `{ messages, hasMore }`, oldest first: the newest `limit`
-  (default 50, at most 2000) or the `limit` before `beforeSeq`. Every message
+  (default 50, at most 2000; NaN or an infinity is refused, here and in every
+  `limit`) or the `limit` before `beforeSeq`. Without `tools` it looks past at
+  most 4,000 tool rows for the page's text ones, then says `hasMore`. Every message
   is kept since API 2, and with `tools: true` there's one row per tool call
   too (`role: "tool"`, a one-line `text` such as "Run the unit tests" or
   "Edited ~/dev/x.ts", and `toolKind`). It reads Convex alone, so it works
   while the Mac is asleep. The website watches only the newest 30 with it and
-  reads older pages once, with `beforeSeq` (`web/src/transcript.ts`); the
-  iPhone still raises `limit` as you scroll back. `phone:thread` stays as API 1 had it (newest 20 text messages plus
+  reads older pages once, with `beforeSeq` (`web/src/transcript.ts`). The
+  iPhone does the same with an 80-row live page and chunks of 200
+  (`MessageHistory.swift`), watching `phone:images` from the first row read
+  once for pictures that finish uploading late; builds before 1.0.5 raise `limit` as you scroll
+  back, re-reading up to 2,000 rows for each new message (37.6 MB on 8 Nov),
+  which is why `PAGE_MAX` stays 2,000 until they're gone. `phone:thread` stays as API 1 had it (newest 20 text messages plus
   any paged ones, never tool rows), for phone apps built before.
 - `phone:threadsAt({ token, view })` (API 43) → `{ rows, at }`, a list once;
   `phone:threadsSince({ token, since })` → `{ rows, gone, more? }`, every row
@@ -561,7 +576,8 @@ Queries:
 - `phone:images({ token, threadId, from })` (API 37) → the thread's pictures
   from that seq on, for a client passing `noImages: true` to `phone:messages`.
 - `phone:command({ token, commandId })` → `{ state: "pending" | "taken" |
-  "done" | "failed", note?, threadId? }`.
+  "done" | "failed", note?, threadId?, result? }`. `result` (API 62) is a
+  `slashCommands` command's answer, the thread's list.
 - `phone:waiting({ token, threadId })` (API 57) → the thread's `send`
   commands not yet finished, oldest first: `{ commandId, state: "pending" |
   "taken", text, photos, createdAt }`. The phone shows each as a faded
@@ -592,9 +608,28 @@ sidebar does; a runner before API 5 sends projects without `icon`.
 Mutations, each returning a `commandId`. The owning runner takes it
 within a second or two while it's online (state `taken`, then `done` or
 `failed` with a `note`); while it's offline the command waits as
-`pending`:
+`pending`, for up to 14 days (then `failed`, `sync:pruneFiles`). At most
+200 commands, or 8 MB of them, wait for one runner; past that the next is
+refused with `{ kind: "tooMany" }` until it takes some. A `runnerId` the
+phone names must be one that has heartbeated (or `"any"`), else
+`{ kind: "notFound" }`:
 
 - `phone:send({ token, threadId, text, answers? })` (`answers`, API 14: the card's asks it answers, `{ action, answer }[]`)
+- `phone:press({ token, threadId, buttonId })` (API 59) → commandId: a
+  reply button's press (docs/protocol.md, "Reply buttons"), queued as a
+  `press` command with `{ buttonId }`. Its `resultThreadId` is the thread
+  the button started or messaged. `phone:messages` rows carry `buttons`,
+  the state of the buttons an assistant message links, since API 59.
+- `phone:slashCommands({ token, threadId })` (API 62) → commandId: asks
+  the thread's runner for the slash commands it can run, for the reply
+  box's palette (docs/protocol.md, "Slash commands"). The runner answers
+  with its `threads.commands` list as the command's `result` (kept by
+  `sync:finishCommand` as for a `call`); an older runner fails it as
+  unknown.
+- `phone:interrupt({ token, threadId })` (API 69) → commandId: Stop,
+  queued as an `interrupt` command, which ends the thread's running turn as
+  Stop on the Mac does. Runners have applied it since API 44 (the main
+  Mac sends it for another runner's thread).
 - `phone:respond({ token, threadId, approvalId, decision: "allow" |
   "allowAlways" | "deny", message? })`
 - `phone:answer({ token, threadId, approvalId, answers: Record<string,
@@ -611,7 +646,8 @@ within a second or two while it's online (state `taken`, then `done` or
   `{ snooze: { until?, untilRestart? } }`, `{ wake: true }`, `{ archive:
   true }`, `{ unarchive: true }`, `{ markSeen: true }`, `{ title }`.
 - `phone:setRunnerOrder({ token, runnerIds })` (API 56): Mike's order for
-  his runners, from the phone's Settings, at most 50 ids, kept in the one
+  his runners, from the phone's Settings (or the Mac's, through its runner:
+  `sync:runnerOrder` and `sync:setRunnerOrder`, API 58, the owner key only), at most 50 ids, kept in the one
   `runnerOrder` row. The phone's new thread sheet offers a runner, starting
   on the first one online in it.
 - `phone:create({ token, text, runnerId?, cwd?, accountId?, model? })`.
@@ -635,7 +671,15 @@ within a second or two while it's online (state `taken`, then `done` or
   after a day, so the phone should ask again rather than expect them to
   stay.
 - `phone:registerDevice({ token, apnsToken, environment: "sandbox" |
-  "production" })`. A push arrives when a thread starts needing Mike,
+  "production", pushKey?, platform? })`. `apnsToken` is the device token in hex.
+  `platform: "android"` (API 66) says it is instead the phone's Firebase token
+  (letters, digits and `_ - :`); the row keeps the name and gets a `platform`,
+  and its pushes go through the relay to Firebase, even from a backend with its
+  own Apple key. An iPhone sends no platform. A phone token
+  keeps at most 5 registrations; a new one past that replaces its oldest.
+  Revoking a token takes effect in that one small write (its phones get no
+  more pushes at once, `devices:targets`); their rows are deleted after, 100
+  a run (`tokens:dropDevices`). A push arrives when a thread starts needing Mike,
   as `{ aps: { alert: { title, body }, sound: "default", "thread-id":
   threadId }, threadId }` for bundle id `com.mikecann.threadbear`; the
   title is the thread's title and the body the question, the approval
@@ -674,6 +718,17 @@ first. The lessons are Agent Archive's:
 - **Cleaning up isn't undoing.** That cleanup also had to reach backups and
   exports, and the keys had been to the AI providers already. So the docs say to
   rotate, and never that the data is secret-free.
+
+- **Scrub before cutting.** Titles, previews, ask lines, the wake note, tool
+  titles, quoted replies and check output are cut short on the runner, and a
+  rule that needs a secret's end (a connection URL's `@`, a closing quote, a
+  length) misses half of one: on 6 Nov Daybreak found a wake note cut through
+  `postgres://alice:password@host` with the password intact. So a cut never
+  lands inside anything the scrub would take out (`runner/src/safe-cut.ts`,
+  with the runner's known values too); it moves back to before it, leaving the
+  runner's own copy unscrubbed. Taking a first line, a first sentence or the
+  last part of something counts as a cut too. The wake note is scrubbed whole
+  on the way up and only then cut.
 
 Not scrubbed, on purpose: a command's words while it's on its way (a message from
 the phone or another Mac has to reach the runner as typed). Once a command is over,
@@ -897,8 +952,9 @@ seconds (73% of row changes on the M5, each re-running a 30 to 40 KB
 rather than all of them, and a new reading time alone isn't a change; the
 website watches a 30-row tail, reads older pages once, watches pictures apart
 (`phone:images`) and lets go of its live queries after a minute hidden. The
-iPhone app still raises `limit` and uses `phone:thread`, which costs about
-70 KB for each message that arrives while a thread is open.
+iPhone app watched `phone:thread` then, about 70 KB for each message that
+arrives while a thread is open; it now watches an 80-row page of
+`phone:messages` and reads older chunks once (9 Nov).
 
 Since measured below: the inbox follows only what changed (API 43), and a
 reading copied from another runner goes up at most every 10 minutes, or at once

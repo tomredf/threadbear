@@ -56,6 +56,70 @@ final class PendingSendTests: XCTestCase {
         XCTAssertEqual(app.errorMessage, "Busy")
     }
 
+    // MARK: Lifting off the composer
+
+    func testOnlyAMessageGoingToTheRunnerNowRises() {
+        func row(_ pending: UserMessage.Pending?) -> TranscriptRow {
+            TranscriptRow(id: "u", seq: 1, content: .user(UserMessage(text: "Hi", pending: pending)))
+        }
+        XCTAssertTrue(SendLift.rises(row(.sending)))
+        XCTAssertFalse(SendLift.rises(row(.queued)), "one queued behind a turn waits with its clock")
+        XCTAssertFalse(SendLift.rises(row(nil)), "history doesn't rise")
+    }
+
+    /// A held message's row grows a line for its note, and the note sits
+    /// under the bubble inside it, with no spinner or clock beside it.
+    func testAHeldMessageShowsItsNoteUnderTheBubble() throws {
+        let width: CGFloat = 700
+        func row(_ pending: UserMessage.Pending?) -> TranscriptRow {
+            TranscriptRow(id: "p:1", seq: 1, content: .user(UserMessage(text: "If the runner is restarting, could it just queue this up?", pending: pending)))
+        }
+        let sending = RowRenderer.render(row(.sending), expanded: false, tableWidth: width, measurer: TextMeasurer())
+        let held = RowRenderer.render(row(.waitingForRunner), expanded: false, tableWidth: width, measurer: TextMeasurer())
+        XCTAssertEqual(held.height, sending.height + RowMetrics.waitingNoteGap + RowMetrics.waitingNoteHeight)
+        let cell = TextRowCell()
+        cell.appearance = NSAppearance(named: .darkAqua)
+        cell.frame = NSRect(x: 0, y: 0, width: width, height: held.height)
+        cell.configure(row: row(.waitingForRunner), render: held, tableWidth: width, expanded: false)
+        let note = try XCTUnwrap(cell.subviews.compactMap { $0 as? NSTextField }.first { $0.stringValue == TextRowCell.waitingNoteText && !$0.isHidden })
+        XCTAssertGreaterThanOrEqual(note.frame.minY, cell.box.frame.maxY)
+        XCTAssertLessThanOrEqual(note.frame.maxY, held.height - RowMetrics.userBottom + 0.5)
+        XCTAssertTrue(cell.pendingMark.isHidden, "the note says it; no mark as well")
+        if let out = ProcessInfo.processInfo.environment["WAITING_SHOT"], let rep = cell.bitmapImageRepForCachingDisplay(in: cell.bounds) {
+            cell.wantsLayer = true
+            cell.layer?.backgroundColor = NSColor(white: 0.12, alpha: 1).cgColor
+            cell.appearance!.performAsCurrentDrawingAppearance { cell.cacheDisplay(in: cell.bounds, to: rep) }
+            try rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+        }
+        // Once it's going, the note goes and the spinner's back.
+        cell.configure(row: row(.sending), render: sending, tableWidth: width, expanded: false)
+        XCTAssertTrue(note.isHidden)
+        XCTAssertFalse(cell.pendingMark.isHidden)
+    }
+
+    /// Well under a fifth of a second, or it reads as latency, and it's on
+    /// the layer rather than stepped from the main thread.
+    func testTheLiftIsQuickAndOnTheLayer() throws {
+        XCTAssertLessThan(SendLift.firstFrame + SendLift.duration, 0.2)
+        let parent = FlippedForLift(frame: NSRect(x: 0, y: 0, width: 100, height: 100))
+        parent.wantsLayer = true
+        let cell = NSView(frame: parent.bounds)
+        parent.addSubview(cell)
+        SendLift.lift(cell)
+        XCTAssertNotNil(cell.layer?.animation(forKey: SendLift.key))
+        XCTAssertEqual(cell.downward(14), 14, "down is +y in a flipped view")
+        XCTAssertEqual(parent.downward(14), -14, "and -y in one that isn't")
+    }
+
+    /// A recycled cell mustn't bring its lift to another row.
+    func testACellDropsItsLiftWhenReused() {
+        let cell = RowCellView()
+        SendLift.lift(cell)
+        XCTAssertNotNil(cell.layer?.animation(forKey: SendLift.key))
+        cell.prepareForReuse()
+        XCTAssertNil(cell.layer?.animation(forKey: SendLift.key))
+    }
+
     /// The pictures' chips go as [Picture N] markers where they sat, the
     /// pictures in the chips' order (docs/protocol.md, "Pictures in a
     /// message"); a failed send puts the chips back.
@@ -189,6 +253,46 @@ final class PendingSendTests: XCTestCase {
         XCTAssertEqual(app.errorMessage, "Busy")
     }
 
+    /// The error bar's Investigate: one thread in the app's own checkout,
+    /// told the error, the thread it came up in and what he was doing; it
+    /// spins until made, then the bar goes and the new thread opens.
+    func testInvestigateStartsAThreadAboutTheErrorAndOpensIt() async throws {
+        let (app, transport) = try await connected()
+        app.select("th1")
+        app.threads["th2"] = try JSONDecoder().decode(ThreadSummary.self, from: Data(#"{"id":"th2","title":"Poddle","cwd":"/Users/m/dev/me/poddle","lastSeq":1}"#.utf8))
+        app.showError("Couldn't trust poddle: Thread not found: th2", in: "th2", doing: "pressing Trust on a patch in the Patches panel")
+        let checkout = try XCTUnwrap(app.ownCheckout, "a debug build knows the checkout it was built from")
+        app.investigateError()
+        XCTAssertTrue(app.creatingThread)
+        try await until { transport.waiting("threads.create") }
+        app.investigateError()
+        XCTAssertEqual(transport.count("threads.create"), 1, "a second press while it's made does nothing")
+        let params = try XCTUnwrap(transport.params("threads.create"))
+        XCTAssertEqual(params["cwd"] as? String, checkout)
+        let text = try XCTUnwrap(params["text"] as? String)
+        XCTAssertTrue(text.contains("> Couldn't trust poddle: Thread not found: th2"))
+        XCTAssertTrue(text.contains("In thread th2 (\"Poddle\"), folder /Users/m/dev/me/poddle"), "the thread acted on, not the one open")
+        XCTAssertTrue(text.contains("The user was pressing Trust on a patch in the Patches panel"))
+        XCTAssertNotNil(app.errorMessage, "the bar stays until the thread is made")
+        transport.answer("threads.create", ["thread": ["id": "th_new", "title": "Error"]])
+        try await until { app.selection == "th_new" }
+        XCTAssertNil(app.errorMessage)
+        XCTAssertFalse(app.creatingThread)
+    }
+
+    /// An error shown plainly is about the thread that's open.
+    func testAPlainErrorIsAboutTheOpenThread() async throws {
+        let (app, _) = try await connected()
+        app.select("th1")
+        app.errorMessage = "Busy"
+        let report = try XCTUnwrap(app.errorReport())
+        XCTAssertEqual(report.threadId, "th1")
+        XCTAssertEqual(report.threadTitle, "Fix it")
+        XCTAssertNil(report.doing)
+        app.errorMessage = nil
+        XCTAssertNil(app.errorReport())
+    }
+
     /// Archive shows at once; a refusal puts the thread back.
     func testArchiveShowsAtOnceAndARefusalPutsItBack() async throws {
         let (app, transport) = try await connected()
@@ -198,6 +302,341 @@ final class PendingSendTests: XCTestCase {
         transport.fail("threads.update", message: "Busy")
         try await until { app.threads["th1"]?.isArchived == false }
         XCTAssertEqual(app.threads["th1"]?.isArchived, false)
+    }
+
+    /// A pick the old runner turns away while restarting (it has let the
+    /// idle thread go) goes again to the new runner once it's connected,
+    /// still showing, with no error, and two picks go in the order they
+    /// were made. Mike picked an effort then and saw "Thread not found"
+    /// (7 Nov).
+    func testAnUpdateTurnedAwayByARestartGoesAgainToTheNewRunnerInOrder() async throws {
+        let (app, old) = try await connected()
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.update("th1", ThreadUpdate(effort: .some("low")))
+        try await until { old.waiting("threads.update") }
+        old.fail("threads.update", code: RPCError.busy, message: "The runner is handing over to a new one; try again in a moment.")
+        app.update("th1", ThreadUpdate(effort: .some("high")))
+        try await until { old.waiting("threads.update") }
+        old.fail("threads.update", code: RPCError.threadNotFound, message: "Thread not found: th1")
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(app.threads["th1"]?.effort, "high", "the pick still shows while the runner restarts")
+        XCTAssertNil(app.errorMessage)
+        let new = HoldingTransport()
+        let client = RPCClient(transport: new)
+        try await client.start()
+        app.useClientForTesting(client)
+        try await until { new.waiting("threads.update") }
+        XCTAssertEqual(new.params("threads.update")?["effort"] as? String, "low")
+        new.answer("threads.update", ["thread": ["id": "th1", "title": "Fix it", "effort": "low"]])
+        try await until { new.count("threads.update") == 2 }
+        XCTAssertEqual(new.params("threads.update")?["effort"] as? String, "high", "the later pick goes after the earlier one")
+        new.answer("threads.update", ["thread": ["id": "th1", "title": "Fix it", "effort": "high"]])
+        try await until { !new.waiting("threads.update") && app.threads["th1"]?.effort == "high" }
+        XCTAssertEqual(app.threads["th1"]?.effort, "high")
+        XCTAssertNil(app.errorMessage)
+    }
+
+    /// The connection the old runner dropped, a new one, and a restart on,
+    /// with a pick of `low` the old runner turned away.
+    private func turnedAwayPick() async throws -> (AppModel, HoldingTransport) {
+        let (app, old) = try await connected()
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.update("th1", ThreadUpdate(effort: .some("low")))
+        try await until { old.waiting("threads.update") }
+        old.fail("threads.update", code: RPCError.busy, message: "The runner is handing over to a new one; try again in a moment.")
+        try await Task.sleep(for: .milliseconds(50))
+        return (app, old)
+    }
+
+    private func newRunner(_ app: AppModel) async throws -> HoldingTransport {
+        let new = HoldingTransport()
+        let client = RPCClient(transport: new)
+        try await client.start()
+        app.useClientForTesting(client)
+        return new
+    }
+
+    /// A pick made once the new runner is up goes after the older one going
+    /// again, so the older one can't undo it (Codex's review, 7 Nov).
+    func testAPickMadeOnceTheNewRunnerIsUpGoesAfterTheOneGoingAgain() async throws {
+        let (app, _) = try await turnedAwayPick()
+        let new = try await newRunner(app)
+        app.update("th1", ThreadUpdate(effort: .some("high")))
+        try await until { new.waiting("threads.update") }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(new.count("threads.update"), 1)
+        XCTAssertEqual(new.params("threads.update")?["effort"] as? String, "low")
+        new.answer("threads.update", ["thread": ["id": "th1", "title": "Fix it", "effort": "low"]])
+        try await until { new.count("threads.update") == 2 }
+        XCTAssertEqual(new.params("threads.update")?["effort"] as? String, "high")
+        new.answer("threads.update", ["thread": ["id": "th1", "title": "Fix it", "effort": "high"]])
+        try await until { !new.waiting("threads.update") && app.threads["th1"]?.effort == "high" }
+        XCTAssertEqual(app.threads["th1"]?.effort, "high")
+        XCTAssertNil(app.errorMessage)
+    }
+
+    /// A message sent while a pick waits for the new runner goes after it,
+    /// so its turn starts on what was picked (Codex's review, 7 Nov).
+    func testAMessageSentWhileAPickWaitsGoesAfterIt() async throws {
+        let (app, old) = try await turnedAwayPick()
+        let session = app.session(for: "th1")
+        app.drafts["th1"] = Draft(text: "go on")
+        app.send(threadId: "th1")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(old.count("threads.send"), 0, "it waits behind the pick rather than going to the old runner")
+        session.connectionLost()
+        XCTAssertEqual(session.pending.map(\.text), ["go on"], "still on its way while it waits")
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.update") }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(new.count("threads.send"), 0)
+        new.answer("threads.update", ["thread": ["id": "th1", "title": "Fix it", "effort": "low"]])
+        try await until { new.waiting("threads.send") }
+        new.answer("threads.send", ["turnId": "turn_1"])
+        try await until { session.pending.first?.queued == true }
+        XCTAssertNil(app.errorMessage)
+    }
+
+    /// One that queued behind a pick whose wait ran out, while the old
+    /// runner still answers, gets a wait of its own rather than failing
+    /// at once (Codex's second review, 7 Nov).
+    func testAMessageBehindAPickThatGaveUpWaitsForTheNewRunnerItself() async throws {
+        let wait = AppModel.restartResendWait
+        AppModel.restartResendWait = .milliseconds(600)
+        defer { AppModel.restartResendWait = wait }
+        let (app, old) = try await turnedAwayPick()
+        let session = app.session(for: "th1")
+        try await Task.sleep(for: .milliseconds(300))
+        app.drafts["th1"] = Draft(text: "go on")
+        app.send(threadId: "th1")
+        // The pick gives up; the message goes to the old runner, which
+        // still turns it away.
+        try await until { old.waiting("threads.send") }
+        old.fail("threads.send", code: RPCError.busy, message: "The runner is handing over to a new one; try again in a moment.")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(session.pending.map(\.text), ["go on"], "still on its way")
+        XCTAssertNil(app.drafts["th1"])
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.send") }
+        new.answer("threads.send", ["turnId": "turn_1"])
+        try await until { session.pending.first?.queued == true }
+        XCTAssertEqual(session.pending.first?.queued, true)
+        XCTAssertNil(app.drafts["th1"])
+    }
+
+    /// Sent while the runner is down for a restart, it waits in the
+    /// transcript with a note under it, rather than bouncing back into
+    /// the box, and goes once the new runner is up (Mike, 9 Nov).
+    func testAMessageSentWhileTheRunnerRestartsWaitsForTheNewOne() async throws {
+        let (app, old) = try await connected()
+        let session = app.session(for: "th1")
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.connectionLostForTesting()
+        session.connectionLost()
+        app.drafts["th1"] = Draft(text: "go on")
+        app.send(threadId: "th1")
+        XCTAssertNil(app.drafts["th1"], "the box empties")
+        XCTAssertNil(app.errorMessage, "no warning: it's waiting, not lost")
+        XCTAssertEqual(session.pending.map(\.text), ["go on"])
+        XCTAssertEqual(session.pending.first?.waitingForRunner, true)
+        XCTAssertEqual(session.pending.first?.row.content, .user(UserMessage(text: "go on", pending: .waitingForRunner)))
+        session.connectionLost()
+        XCTAssertEqual(session.pending.map(\.text), ["go on"], "another drop doesn't take it away")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(old.count("threads.send"), 0)
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.send") }
+        XCTAssertEqual(new.params("threads.send")?["text"] as? String, "go on")
+        XCTAssertEqual(session.pending.first?.waitingForRunner, false, "the note goes once it's on its way")
+        new.answer("threads.send", ["turnId": "turn_1"])
+        try await until { session.pending.first?.queued == true }
+        XCTAssertNil(app.errorMessage)
+    }
+
+    /// On its way as a handing-over runner closed its port, so no answer
+    /// came: an idle thread's message waits for the new runner and goes
+    /// there, rather than back into a box Mike may have left (10 Nov).
+    func testASendCutOffByARestartGoesAgainToTheNewRunner() async throws {
+        let (app, old) = try await connected()
+        let session = app.session(for: "th1")
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.drafts["th1"] = Draft(text: "make the demo")
+        app.send(threadId: "th1")
+        try await until { old.waiting("threads.send") }
+        old.drop()
+        app.connectionLostForTesting()
+        session.connectionLost()
+        try await until { session.pending.first?.waitingForRunner == true }
+        XCTAssertEqual(session.pending.map(\.text), ["make the demo"], "still on its way, with the note")
+        XCTAssertNil(app.drafts["th1"])
+        XCTAssertNil(app.errorMessage)
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.list") }
+        new.answer("threads.list", ["threads": [["id": "th1", "title": "Fix it", "lastSeq": 12, "status": "idle"]]])
+        try await until { new.waiting("threads.events") }
+        XCTAssertEqual(new.params("threads.events")?["afterSeq"] as? Int, 12, "it looks after the seq it was sent at")
+        new.answer("threads.events", ["events": [], "firstSeq": 0, "lastSeq": 12])
+        try await until { new.waiting("threads.send") }
+        XCTAssertEqual(new.params("threads.send")?["text"] as? String, "make the demo")
+        new.answer("threads.send", ["turnId": "turn_1"])
+        try await until { session.pending.first?.queued == true }
+        XCTAssertNil(app.drafts["th1"])
+        XCTAssertNil(app.errorMessage)
+    }
+
+    /// If the old runner took it before the port closed, the thread shows
+    /// it, and it isn't sent a second time.
+    func testASendCutOffThatHadArrivedIsntSentTwice() async throws {
+        let (app, old) = try await connected()
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.drafts["th1"] = Draft(text: "make the demo")
+        app.send(threadId: "th1")
+        try await until { old.waiting("threads.send") }
+        old.drop()
+        app.connectionLostForTesting()
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.list") }
+        new.answer("threads.list", ["threads": [["id": "th1", "title": "Fix it", "lastSeq": 13, "status": "idle"]]])
+        try await until { new.waiting("threads.events") }
+        let landed: [String: Any] = ["seq": 13, "ts": "2026-11-10T02:36:54Z", "threadId": "th1", "turnId": "t1", "type": "user.message", "text": "make the demo"]
+        new.answer("threads.events", ["events": [landed], "firstSeq": 13, "lastSeq": 13])
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(new.count("threads.send"), 0)
+        XCTAssertNil(app.drafts["th1"])
+        XCTAssertNil(app.errorMessage)
+    }
+
+    /// A busy thread's runner may have queued it where nothing shows, so it
+    /// isn't sent again on a guess: it goes back in the box, and the banner
+    /// names the thread and stays once the app reconnects.
+    func testACutOffSendToABusyThreadGoesBackInTheBoxAndSaysWhere() async throws {
+        let (app, old) = try await connected()
+        app.threads["th1"] = try JSONDecoder().decode(ThreadSummary.self, from: Data(#"{"id":"th1","title":"Fix it","lastSeq":12,"status":"running"}"#.utf8))
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.drafts["th1"] = Draft(text: "and the docs")
+        app.send(threadId: "th1")
+        try await until { old.waiting("threads.send") }
+        old.drop()
+        try await until { app.drafts["th1"] != nil }
+        XCTAssertEqual(app.drafts["th1"]?.text, "and the docs")
+        XCTAssertEqual(app.errorMessage, "Lost the connection to the runner. Your message to “Fix it” wasn't sent. It's back in its box.")
+        app.clearConnectionError()
+        XCTAssertNotNil(app.errorMessage, "reconnecting doesn't take it away")
+    }
+
+    /// Still with the old runner (a turn-end hook running, say), it may be
+    /// queued there where nothing shows: back in the box, not sent twice.
+    func testACutOffSendToAThreadStillOnTheOldRunnerGoesBackInTheBox() async throws {
+        let (app, old) = try await connected()
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.drafts["th1"] = Draft(text: "make the demo")
+        app.send(threadId: "th1")
+        try await until { old.waiting("threads.send") }
+        old.drop()
+        app.connectionLostForTesting()
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.list") }
+        new.answer("threads.list", ["threads": [["id": "th1", "title": "Fix it", "lastSeq": 12, "status": "idle", "onOldRunner": true]]])
+        try await until { app.drafts["th1"] != nil }
+        XCTAssertEqual(app.drafts["th1"]?.text, "make the demo")
+        XCTAssertEqual(new.count("threads.send"), 0)
+        XCTAssertEqual(app.errorMessage, "Lost the connection to the runner. Your message to “Fix it” wasn't sent. It's back in its box.")
+    }
+
+    /// With another message still on its way, the runner may have queued
+    /// this one where nothing shows, so it goes back in the box instead.
+    func testACutOffSendWithAnotherOnItsWayGoesBackInTheBox() async throws {
+        let (app, old) = try await connected()
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.drafts["th1"] = Draft(text: "first")
+        app.send(threadId: "th1")
+        app.drafts["th1"] = Draft(text: "second")
+        app.send(threadId: "th1")
+        try await until { old.count("threads.send") == 2 }
+        old.drop()
+        try await until { app.drafts["th1"] != nil }
+        XCTAssertTrue(app.drafts["th1"]?.text.contains("second") == true)
+        XCTAssertNotNil(app.errorMessage)
+    }
+
+    /// Two sent while it's down go in the order they were sent.
+    func testMessagesHeldForARestartGoInOrder() async throws {
+        let (app, _) = try await connected()
+        let session = app.session(for: "th1")
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.connectionLostForTesting()
+        app.drafts["th1"] = Draft(text: "first")
+        app.send(threadId: "th1")
+        app.drafts["th1"] = Draft(text: "second")
+        app.send(threadId: "th1")
+        XCTAssertEqual(session.pending.map(\.text), ["first", "second"])
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.send") }
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(new.count("threads.send"), 1, "the second waits for the first")
+        XCTAssertEqual(new.params("threads.send")?["text"] as? String, "first")
+        new.answer("threads.send", ["turnId": "turn_1"])
+        try await until { new.count("threads.send") == 2 }
+        XCTAssertEqual(new.params("threads.send")?["text"] as? String, "second")
+    }
+
+    /// A runner that doesn't come back: the words go back in the box.
+    func testAHeldMessageGoesBackInTheBoxIfTheRunnerDoesntComeBack() async throws {
+        let wait = AppModel.restartHoldWait
+        AppModel.restartHoldWait = .milliseconds(300)
+        defer { AppModel.restartHoldWait = wait }
+        let (app, _) = try await connected()
+        let session = app.session(for: "th1")
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.connectionLostForTesting()
+        app.drafts["th1"] = Draft(text: "go on")
+        app.send(threadId: "th1")
+        try await until { app.drafts["th1"] != nil }
+        XCTAssertEqual(app.drafts["th1"]?.text, "go on")
+        XCTAssertTrue(session.pending.isEmpty)
+        XCTAssertEqual(app.errorMessage, "Not connected to the runner, so that wasn't sent. It's still in the box.")
+    }
+
+    /// With no restart on, a dropped connection still says it wasn't sent.
+    func testASendWhileDisconnectedWithNoRestartStaysInTheBox() async throws {
+        let (app, _) = try await connected()
+        app.connectionLostForTesting()
+        app.drafts["th1"] = Draft(text: "go on")
+        app.send(threadId: "th1")
+        XCTAssertEqual(app.drafts["th1"]?.text, "go on")
+        XCTAssertTrue(app.session(for: "th1").pending.isEmpty)
+        XCTAssertEqual(app.errorMessage, "Not connected to the runner, so that wasn't sent. It's still in the box.")
+    }
+
+    /// Archive turned away by a restart goes again too, rather than coming
+    /// back with an error (Codex's review, 7 Nov).
+    func testAnArchiveTurnedAwayByARestartGoesAgain() async throws {
+        let (app, old) = try await connected()
+        _ = app.restart(notice: "The runner is restarting onto a new release.")
+        app.archive("th1")
+        try await until { old.waiting("threads.update") }
+        old.fail("threads.update", code: RPCError.threadNotFound, message: "Thread not found: th1")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(app.errorMessage)
+        let new = try await newRunner(app)
+        try await until { new.waiting("threads.update") }
+        XCTAssertEqual(new.params("threads.update")?["archived"] as? Bool, true)
+        new.answer("threads.update", ["thread": ["id": "th1", "title": "Fix it", "archivedAt": "2026-11-07T00:10:50Z"]])
+        try await until { app.threads["th1"]?.isArchived == true }
+        XCTAssertEqual(app.threads["th1"]?.isArchived, true)
+        XCTAssertNil(app.errorMessage)
+    }
+
+    /// With no restart on, "Thread not found" for a pick is shown, and the
+    /// guess put back.
+    func testAnUpdateForAThreadNotFoundWithNoRestartStillFails() async throws {
+        let (app, transport) = try await connected()
+        app.update("th1", ThreadUpdate(effort: .some("high")))
+        try await until { transport.waiting("threads.update") }
+        transport.fail("threads.update", code: RPCError.threadNotFound, message: "Thread not found: th1")
+        try await until { app.errorMessage != nil }
+        XCTAssertEqual(app.errorMessage, "Thread not found: th1")
+        XCTAssertNil(app.threads["th1"]?.effort)
     }
 
     /// The guesses: what the runner will do for the simple fields, and
@@ -224,12 +663,13 @@ final class PendingSendTests: XCTestCase {
 
 /// Holds every request until the test answers or fails it, like a runner
 /// whose event loop is stalled.
-private final class HoldingTransport: RPCTransport, @unchecked Sendable {
+final class HoldingTransport: RPCTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var inbox: [Data] = []
     private var waiter: CheckedContinuation<Data, Error>?
     private var held: [(id: Int, method: String)] = []
     private var counts: [String: Int] = [:]
+    private var lastParams: [String: [String: Any]] = [:]
 
     func open() async throws {}
 
@@ -239,6 +679,7 @@ private final class HoldingTransport: RPCTransport, @unchecked Sendable {
         lock.lock()
         held.append((id, method))
         counts[method, default: 0] += 1
+        lastParams[method] = object["params"] as? [String: Any]
         lock.unlock()
     }
 
@@ -246,6 +687,13 @@ private final class HoldingTransport: RPCTransport, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return held.contains { $0.method == method }
+    }
+
+    /// The params of the latest request for `method`.
+    func params(_ method: String) -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastParams[method]
     }
 
     func count(_ method: String) -> Int {
@@ -287,6 +735,15 @@ private final class HoldingTransport: RPCTransport, @unchecked Sendable {
 
     func close() {}
 
+    /// The runner closes the socket with requests unanswered.
+    func drop() {
+        lock.lock()
+        let waiter = self.waiter
+        self.waiter = nil
+        lock.unlock()
+        waiter?.resume(throwing: URLError(.networkConnectionLost))
+    }
+
     private func push(_ object: [String: Any]) {
         let data = try! JSONSerialization.data(withJSONObject: object)
         lock.lock()
@@ -299,4 +756,8 @@ private final class HoldingTransport: RPCTransport, @unchecked Sendable {
             lock.unlock()
         }
     }
+}
+
+private final class FlippedForLift: NSView {
+    override var isFlipped: Bool { true }
 }

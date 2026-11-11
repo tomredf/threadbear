@@ -8,19 +8,25 @@ import Foundation
 public struct RemoteThreads: Sendable, Hashable, Decodable {
     public var runners: [RemoteRunner]
     public var threads: [RemoteThread]
+    /// Mike's runner order (backend API 58): every runner's id, this one's
+    /// too, the same order the phone sets. Nil from an older runner or
+    /// backend, which has none to give.
+    public var order: [String]?
 
-    public init(runners: [RemoteRunner] = [], threads: [RemoteThread] = []) {
+    public init(runners: [RemoteRunner] = [], threads: [RemoteThread] = [], order: [String]? = nil) {
         self.runners = runners
         self.threads = threads
+        self.order = order
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         runners = c.lossyArray(RemoteRunner.self, forKey: .runners)
         threads = c.lossyArray(RemoteThread.self, forKey: .threads)
+        order = try? c.decodeIfPresent([String].self, forKey: .order)
     }
 
-    enum CodingKeys: String, CodingKey { case runners, threads }
+    enum CodingKeys: String, CodingKey { case runners, threads, order }
 
     public func runner(_ id: String) -> RemoteRunner? { runners.first { $0.id == id } }
 
@@ -92,6 +98,11 @@ public struct RemoteThread: Sendable, Hashable, Decodable {
     public var startedBy: ThreadStartedBy?
     /// What Mike last said to it (backend API 32): the row's "You: ...".
     public var asked: String?
+    /// The librarian's recap (backend API 70): the recap box.
+    public var recap: String?
+    /// A move the main Mac's runner knows of (docs/protocol.md, "Moving a
+    /// thread to another runner"), put on the row by it, never by the backend.
+    public var moving: ThreadMoving?
 
     public init(runnerId: String, threadId: String, title: String = "", cwd: String = "", accountId: String = "", provider: String = "claude",
                 model: String? = nil, status: ThreadStatus = .idle, needsYou: Bool = false, unread: Bool = false, preview: String = "",
@@ -136,11 +147,13 @@ public struct RemoteThread: Sendable, Hashable, Decodable {
         starredAt = text(.starredAt).flatMap(ISO8601.parse)
         startedBy = (try? c.decodeIfPresent(ThreadStartedBy.self, forKey: .startedBy)) ?? nil
         asked = text(.asked).flatMap { $0.isEmpty ? nil : $0 }
+        recap = text(.recap).flatMap { $0.isEmpty ? nil : $0 }
+        moving = (try? c.decodeIfPresent(ThreadMoving.self, forKey: .moving)) ?? nil
     }
 
     enum CodingKeys: String, CodingKey {
         case runnerId, threadId, title, cwd, accountId, provider, model, status, needsYou, unread, preview
-        case createdAt, lastActivityAt, snoozedUntil, archivedAt, starredAt, startedBy, asked
+        case createdAt, lastActivityAt, snoozedUntil, archivedAt, starredAt, startedBy, asked, recap, moving
     }
 
     /// As a summary the sidebar's rows and sections take like a local one.
@@ -160,6 +173,8 @@ public struct RemoteThread: Sendable, Hashable, Decodable {
         summary.runnerId = runnerId
         summary.startedBy = startedBy
         summary.asked = asked
+        summary.recap = recap
+        summary.moving = moving
         return summary
     }
 

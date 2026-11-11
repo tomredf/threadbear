@@ -8,6 +8,8 @@
 // for an iPhone one, {{icon <name>}} for a Phosphor icon, {{fork}} and {{appStoreBadge}} for the
 // two ways to get it, and {{commits}} / {{firstDay}} for the repo's own numbers.
 //
+// The changelog (/changelog) isn't in src either: scripts/changelog.mjs makes it from site/changelog/.
+//
 // The docs pages (/docs and /docs/<slug>) aren't in src: scripts/docs.mjs makes them from the
 // repo's docs/guide.md, a page per `## ` section, in the same layout.
 //
@@ -20,6 +22,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { APP_STORE_LIVE, APP_STORE_URL, GITHUB_PUBLIC, GITHUB_URL, LAUNCH_VIDEO_ID, SITE_URL } from "../site.mjs";
 import { markdown, readGuide, summary } from "./docs.mjs";
+import { changelogPage, readReleases } from "./changelog.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const src = join(root, "src");
@@ -351,6 +354,7 @@ function writePage(name, page, content, label = `${name}.html`) {
     homeCurrent: name === "index" ? ' aria-current="page"' : "",
     privacyCurrent: name === "privacy" ? ' aria-current="page"' : "",
     supportCurrent: name === "support" ? ' aria-current="page"' : "",
+    changelogCurrent: name === "changelog" ? ' aria-current="page"' : "",
     // Every docs page is under Docs in the nav, so it's marked there too (the index only in
     // the docs list, where it's the page itself).
     docsCurrent: inDocs ? ' aria-current="page"' : "",
@@ -387,11 +391,18 @@ for (const file of pages) {
 const appDocSlugs = JSON.parse(readFileSync(join(root, "app-doc-slugs.json"), "utf8"));
 const guide = readGuide(join(root, ".."), appDocSlugs);
 const docSlugs = new Set(guide.sections.map((s) => s.slug));
+// Each docs page's icon (docs-icons.json, a slug to a Phosphor icon in src/icons): beside its name
+// in the list and on its title. A section added to the guide without one stops the build.
+const docIcons = JSON.parse(readFileSync(join(root, "docs-icons.json"), "utf8"));
+const docIcon = (slug) => {
+  if (!docIcons[slug]) throw new Error(`docs/guide.md's section ${slug} has no icon in site/docs-icons.json`);
+  return icon(docIcons[slug]);
+};
 function docsNav(current) {
   const items = guide.sections.map(({ slug, title }) =>
-    `          <li><a href="/docs/${slug}"${slug === current ? ' aria-current="page"' : ""}>${escape(title)}</a></li>`);
+    `          <li><a href="/docs/${slug}"${slug === current ? ' aria-current="page"' : ""}>${docIcon(slug)}<span>${escape(title)}</span></a></li>`);
   return `      <nav class="docs-nav" aria-label="Docs">
-        <a class="docs-home" href="/docs"${current ? "" : ' aria-current="page"'}>${escape(guide.title)}</a>
+        <a class="docs-home" href="/docs"${current ? "" : ' aria-current="page"'}>${icon("book-open")}<span>${escape(guide.title)}</span></a>
         <ol>
 ${items.join("\n")}
         </ol>
@@ -409,7 +420,7 @@ ${docsNav(null)}
 ${markdown(guide.intro, docSlugs)}
         </div>
         <ol class="doc-index">
-${guide.sections.map(({ slug, title }) => `          <li><a href="/docs/${slug}">${escape(title)}</a></li>`).join("\n")}
+${guide.sections.map(({ slug, title }) => `          <li><a href="/docs/${slug}">${docIcon(slug)}<span>${escape(title)}</span></a></li>`).join("\n")}
         </ol>
       </article>
     </div>`);
@@ -418,12 +429,19 @@ guide.sections.forEach(({ slug, title, body }, index) => {
   writePage(`docs/${slug}`, { title: `${title} · Threadbear docs`, description: summary(body) || `${title}, from the Threadbear guide.`, path: `/docs/${slug}` }, `    <div class="docs">
 ${docsNav(slug)}
       <article class="legal doc">
-        <h1>${escape(title)}</h1>
+        <h1 class="doc-title"><span class="doc-title-icon">${docIcon(slug)}</span>${escape(title)}</h1>
 ${markdown(body, docSlugs)}
         ${next ? `<p class="doc-next"><a href="/docs/${next.slug}">Next: ${escape(next.title)}</a></p>` : `<p class="doc-next"><a href="/docs">All the docs</a></p>`}
       </article>
     </div>`, `docs/${slug} (docs/guide.md)`);
 });
+
+// The changelog (scripts/changelog.mjs): a section per release from site/changelog/.
+writePage("changelog", {
+  title: "What's new · Threadbear",
+  description: "What's new in Threadbear, a release at a time, with a look at the biggest changes.",
+  path: "/changelog",
+}, changelogPage({ releases: readReleases(join(root, "changelog")), githubUrl: GITHUB_URL }));
 
 // Every link and image that stays on the site has to land somewhere: a page, a file, and the
 // #anchor on it if there is one.
@@ -432,6 +450,9 @@ for (const [name, { html }] of built) {
     const [path, anchor] = target.split("#");
     const clean = path.split("?")[0];
     const pageName = clean === "/" ? "index" : clean.slice(1);
+    // The changelog's pictures and clips are in R2, served by the Worker, not in dist.
+    // `npm run media -- check` checks they're up.
+    if (clean.startsWith("/media/")) continue;
     const page = built.get(pageName);
     if (!page && !existsSync(join(dist, clean))) throw new Error(`${name}.html: ${attr}="${target}" goes nowhere`);
     if (anchor && !(page ?? built.get(name)).html.includes(` id="${anchor}"`)) throw new Error(`${name}.html: ${target} has no #${anchor}`);

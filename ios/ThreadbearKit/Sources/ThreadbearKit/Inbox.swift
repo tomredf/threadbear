@@ -107,8 +107,8 @@ public struct InboxSections: Sendable, Equatable {
     /// the sidebar agree on what's in the inbox; change both together.
     /// Running: a turn is underway, or background work is still going.
     /// Scheduled: idle with a schedule due to message it (`wakes`), and
-    /// nothing for Mike: no question, no design review, no unread reply
-    /// that didn't say "nothing", no open asks, not waiting for a login
+    /// nothing for Mike: no question, no design review, no reply wanting
+    /// him (one that said "nothing" doesn't), no open asks, not waiting for a login
     /// with room. Inbox: everything else. Starred takes a starred thread
     /// from all of these, whatever it's doing.
     public static func build(_ threads: some Sequence<PhoneThread>, now: Date, wakes: [String: PhoneSchedule] = [:]) -> InboxSections {
@@ -176,13 +176,12 @@ public struct InboxSections: Sendable, Equatable {
         return soonest
     }
 
-    /// Lowest first. 0: stuck on his answer. 1: finished unread with a
-    /// failure. 2: finished unread. 3: read but failed or stopped. 4: done.
+    /// How much an inbox thread wants Mike, lowest first (InboxUrgency,
+    /// the Mac's rule too). Unread alone isn't wanting him: a turn that
+    /// said "nothing" is done, as on the Mac.
     public static func urgency(_ thread: PhoneThread) -> Int {
-        let broken = thread.status == .error || thread.status == .stopped
-        if thread.reviewWaiting || needsAnswer(thread) { return 0 }
-        if thread.needsYou || thread.unread { return broken ? 1 : 2 }
-        return broken ? 3 : 4
+        InboxUrgency.of(answerWaiting: thread.reviewWaiting || needsAnswer(thread), needsYou: thread.needsYou,
+                        broken: thread.status == .error || thread.status == .stopped)
     }
 
     public static func needsAnswer(_ thread: PhoneThread) -> Bool {
@@ -206,11 +205,12 @@ public struct InboxSections: Sendable, Equatable {
         a.lastActivityAt != b.lastActivityAt ? a.lastActivityAt > b.lastActivityAt : a.threadId < b.threadId
     }
 
-    /// The badge: threads waiting on an answer or not read yet. A star doesn't
-    /// take one out of it, unless it's hibernating, which isn't counted either.
+    /// The badge: threads waiting on an answer or wanting him (InboxUrgency),
+    /// as the Mac's Dock badge. A star doesn't take one out of it, unless
+    /// it's hibernating, which isn't counted either.
     public var needsYouCount: Int {
         let awake = starred.filter { $0.snoozedUntil == nil && $0.snoozedUntilRestart != true }
-        return (awake + inbox).filter { Self.urgency($0) <= 2 }.count
+        return (awake + inbox).filter { InboxUrgency.counts(Self.urgency($0)) }.count
     }
 
     public var isEmpty: Bool { starred.isEmpty && inbox.isEmpty && running.isEmpty && scheduled.isEmpty }
@@ -293,7 +293,7 @@ public enum RowStatus {
     /// starts, so for a running thread it's the turn's start (the Mac's
     /// ThreadRowLook.workingLabel).
     public static func workingLabel(since start: Date, now: Date) -> String {
-        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        let seconds = max(0, Int(saturating: now.timeIntervalSince(start)))
         if seconds < 60 { return "\(seconds)s" }
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m" }
@@ -308,8 +308,8 @@ public enum RelativeTime {
     public static func short(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
         let seconds = now.timeIntervalSince(date)
         if seconds < 60 { return "now" }
-        if seconds < 3600 { return "\(Int(seconds / 60))m" }
-        if seconds < 86_400 { return "\(Int(seconds / 3600))h" }
+        if seconds < 3600 { return "\(Int(saturating: seconds / 60))m" }
+        if seconds < 86_400 { return "\(Int(saturating: seconds / 3600))h" }
         if seconds < 6 * 86_400 {
             return date.formatted(Date.FormatStyle(calendar: calendar).weekday(.abbreviated))
         }
@@ -335,7 +335,10 @@ public enum RelativeTime {
 public enum PreviewText {
     public static func plain(_ text: String) -> String {
         var line = text
-        line = line.replacingOccurrences(of: #"!?\[([^\]]*)\]\([^)]*\)"#, with: "$1", options: .regularExpression)
+        // A `[` with no link after it uses up what it was tried against,
+        // rather than every `[` being tried to the end again, which was
+        // quadratic (cross-lab review, 7 Nov 2026). The same links match.
+        line = line.replacing(/!?\[([^\]]*)(?:\]\([^)]*(\))?)?/) { $0.2 == nil ? String($0.0) : String($0.1) }
         line = line.replacingOccurrences(of: #"(^|\s)(#{1,6}|>)\s+"#, with: "$1", options: .regularExpression)
         for marker in ["**", "__", "~~", "`"] {
             line = line.replacingOccurrences(of: marker, with: "")

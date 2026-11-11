@@ -78,8 +78,10 @@ private struct LibrarianState: View {
                 .tip("Today's looks, quiet catch-ups it skipped without asking the model, and tokens used on your Claude login")
             HStack(spacing: zoomed(8)) {
                 Button(status.paused ? "Resume" : "Pause") { app.setLibrarianPaused(!status.paused) }
+                    .disabled(app.isBusy(BusyKey.pauseLibrarian))
                     .tip(status.paused ? "Let it look at threads again" : "Stop looking at threads; what's queued waits")
                 Button("Look at everything") { app.runLibrarian() }
+                    .busy(app.isBusy(BusyKey.runLibrarian(nil)))
                     .tip("Queue a look at every thread it hasn't looked at yet, newest first")
             }
             .controlSize(.small)
@@ -181,7 +183,13 @@ private struct EntryRow: View {
         }
         .padding(EdgeInsets(top: zoomed(7), leading: SidebarMetrics.leading, bottom: zoomed(7), trailing: SidebarMetrics.trailing))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .tip(EntryRow.help(entry))
+        .tip(help)
+    }
+
+    /// Why it filed the thread, then what prompted the look.
+    private var help: String {
+        let why = LibrarianText.filingReasons(entry) { app.project($0)?.title }
+        return (why + [EntryRow.help(entry)]).joined(separator: "\n")
     }
 
     static func outcomeWords(_ outcome: LibrarianEntry.Outcome) -> String {

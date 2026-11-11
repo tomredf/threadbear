@@ -2,12 +2,14 @@ import fs from 'node:fs';
 import { readSandbox, type SandboxConfig } from './sandbox.ts';
 import os from 'node:os';
 import path from 'node:path';
+import { extraUpdatesFrom, type ExtraUpdate } from './updates/extra.ts';
 import crypto from 'node:crypto';
 import { atomicWriteFileSync } from './fsutil.ts';
 import { RELEASE } from './release.ts';
-import { findGateway, gatewayBase } from './connectors.ts';
+import { gatewayBase, gatewayUrlFrom } from './connectors.ts';
+import { credentialUrlProblem } from './secure-url.ts';
 import { findGatewayClient } from './notion-tasks.ts';
-import { CLI_POLICIES, isEffortLevel, isProvider, type CliPolicy, type EffortLevel, type Provider } from './protocol.ts';
+import { CLI_POLICIES, isEffortLevel, isProvider, type CliPolicy, type EffortLevel, type PermissionMode, type Provider } from './protocol.ts';
 
 // <package version>+<release id>, or +source when run from a checkout.
 export const RUNNER_VERSION = RELEASE.version;
@@ -33,10 +35,15 @@ export const DEFAULT_POOL_FOLDERS: Record<string, string[]> = {};
 export type CliUpdatesConfig = {
   claude: CliPolicy;
   codex: CliPolicy;
+  // The ACP agents: absent is off, as they have no version feed to notify from.
+  cursor?: CliPolicy;
+  opencode?: CliPolicy;
   checkMinutes: number;
   keepCodexVersions: number; // Codex copies kept under <home>/tools/codex
+  // Other CLIs' update commands, run daily (updates/extra.ts). None by default.
+  extra?: ExtraUpdate[];
 };
-export const DEFAULT_CLI_UPDATES: CliUpdatesConfig = { claude: 'auto', codex: 'auto', checkMinutes: 60, keepCodexVersions: 2 };
+export const DEFAULT_CLI_UPDATES: CliUpdatesConfig = { claude: 'auto', codex: 'auto', checkMinutes: 60, keepCodexVersions: 2, extra: [] };
 
 // Everything that differs between the real install and a test lives here, so
 // tests can point THREADBEAR_HOME and THREADBEAR_PORT somewhere harmless and
@@ -64,6 +71,11 @@ export type Config = {
     model?: string;
     models?: Partial<Record<Provider, string>>;
     efforts?: Partial<Record<Provider, EffortLevel>>;
+    // The mode a thread that names none starts on (the phone, the website,
+    // tb new, a schedule without one) and the app's composer starts on.
+    // Unset is full, so an install from before it changes nothing; setup
+    // writes "auto" into a new install's runner.json (scripts/setup.mjs).
+    permissionMode?: DefaultMode;
   };
   // Where accounts are discovered. Tests can narrow these.
   claudeMainDir: string;
@@ -76,6 +88,10 @@ export type Config = {
   // Threadbear's own copy (<home>/tools/codex/current), or until there is
   // one the codex next to the runner's Node; never ~/.local/bin/codex.
   codexPath?: string;
+  // Used as is by the ACP agents (adapters/acp/agents.ts), else wherever
+  // each is installed. Only with the acpAgents experiment on.
+  cursorPath?: string;
+  opencodePath?: string;
   codexArgs: string[]; // extra `codex app-server` arguments
   codexMainDir: string; // codex-main's CODEX_HOME
   tokenStatsLimitsFile: string; // Token Stats' limits.json, read only
@@ -102,9 +118,17 @@ export type Config = {
   // and a headline, and the agent's message straight after it is the
   // turn's reply. Off by default while Mike tries it (1 Nov 2026).
   oneReply: boolean;
+  // Review by another lab (runner/lab-review.ts): a turn that changed code
+  // and needs nothing is reviewed on the other provider before it counts as
+  // done. On unless runner.json has `labReview: false` (Settings > General);
+  // an experiment from 6 Nov until Mike made it standard on 10 Nov 2026.
+  labReview: boolean;
+  // Keep the Mac out of idle sleep while threads work (keep-awake.ts). On
+  // unless runner.json says `keepAwake: false` (Settings > General).
+  keepAwake: boolean;
   // Mike's runner tags a signed release of main once a day for everyone
   // else's copy (src/upstream.ts): runner.json `releases`.
-  releases?: { publish: boolean; signingKey?: string };
+  releases?: { publish: boolean; signingKey?: string; signingProvider?: string };
   // The runner's own model calls (src/models/): the pool whose Claude
   // logins answer them (null: none, so no small jobs) and folders whose
   // threads are never sent.
@@ -112,7 +136,9 @@ export type Config = {
   // The Convex mirror (src/sync.ts): the project's URL, whether it's on,
   // the name the phone shows for this runner and its id (made once).
   // THREADBEAR_SYNC=off turns it off for tests and dev runners.
-  sync: { enabled: boolean; url?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean; full?: boolean };
+  // urlRefused: why the configured url isn't used (plain http off this
+  // Mac, secure-url.ts), so sync is off and tb status says why.
+  sync: { enabled: boolean; url?: string; urlRefused?: string; site?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean; full?: boolean };
   // The silent on-device secret check (src/secret-check.ts): off unless asked.
   secretCheck?: boolean;
   // Mike's Connectors gateway's base URL (connectors.ts), for the app's
@@ -122,6 +148,9 @@ export type Config = {
   // Authorization header, for reading projects' Notion boards
   // (notion-tasks.ts). Only with connectorsUrl.
   connectorsClient?: { mcpUrl: string; headersHelper: string };
+  // Why a configured gateway URL isn't used (plain http off this Mac,
+  // secure-url.ts): the Connectors panel's off state and the log say it.
+  connectorsRefused?: string;
 };
 
 export type RunnerJson = {
@@ -139,11 +168,14 @@ export type RunnerJson = {
     model?: string;
     models?: Partial<Record<Provider, string>>;
     efforts?: Partial<Record<Provider, EffortLevel>>;
+    permissionMode?: DefaultMode;
   };
   claudePath?: string;
   idleMinutes?: number;
   maxLiveCLIs?: number;
   codexPath?: string;
+  cursorPath?: string;
+  opencodePath?: string;
   codexArgs?: string[];
   cliUpdates?: Partial<CliUpdatesConfig>;
   accountNotes?: Record<string, string>;
@@ -151,6 +183,9 @@ export type RunnerJson = {
   sandbox?: unknown;
   pools?: unknown[];
   followMain?: boolean;
+  // This machine's main is GitHub's (follow-origin.ts): read by that file,
+  // each time, so it needs no restart.
+  followOrigin?: boolean;
   // The ssh host that ./check.sh sends the repo's checks to, so suites and
   // the app's test windows stay off this Mac (scripts/check-remote.sh), or
   // checkHosts, several tried in order, which wins (a check.sh from before
@@ -159,9 +194,11 @@ export type RunnerJson = {
   checkHosts?: string[];
   bulletReplies?: boolean;
   oneReply?: boolean;
+  labReview?: boolean;
+  keepAwake?: boolean;
   // bringIn: how often a fork's runner starts a thread to bring in Mike's
   // releases (bring-in.ts): every so many days, 'important' or 'off'.
-  releases?: { publish?: boolean; signingKey?: string; bringIn?: number | 'important' | 'off' };
+  releases?: { publish?: boolean; signingKey?: string; signingProvider?: string; bringIn?: number | 'important' | 'off' };
   models?: { pool?: string | null; privateFolders?: string[] };
   // icon: an SF Symbol for this runner in lists (machine.ts works one out).
   // rpcUrl: how a Mac app reaches this runner over the tailnet (step 6 part 2).
@@ -169,7 +206,7 @@ export type RunnerJson = {
   // (docs/full-convex.md). Off unless you say so.
   // pastedPictures: false keeps pictures you paste off your Convex deployment
   // (docs/on-your-mac.md).
-  sync?: { enabled?: boolean; url?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean; full?: boolean };
+  sync?: { enabled?: boolean; url?: string; site?: string; name?: string; runnerId?: string; icon?: string; rpcUrl?: string; pastedPictures?: boolean; full?: boolean };
   secretCheck?: { enabled?: boolean };
   // Days after a thread is archived that housekeeping clears its pictures
   // (housekeeping.ts). Absent: they're kept. Mike's runners set 30.
@@ -181,6 +218,14 @@ export type RunnerJson = {
   connectors?: { url?: string; enabled?: boolean; headersHelper?: string };
 };
 
+// What defaults.permissionMode may be. Not Plan first: that waits for Mike
+// to approve a plan, so a thread nobody's watching (a schedule, one from
+// the phone) would only sit there.
+export type DefaultMode = Exclude<PermissionMode, 'plan'>;
+export function defaultModeOf(v: unknown): DefaultMode | undefined {
+  return v === 'full' || v === 'ask' || v === 'auto' ? v : undefined;
+}
+
 export function defaultHome(): string {
   return path.join(os.homedir(), 'Library', 'Application Support', 'Threadbear');
 }
@@ -191,16 +236,108 @@ export function expandHome(p: string): string {
   return p;
 }
 
+// A runner.json that's there but doesn't read as a JSON object: a hand edit
+// with a trailing comma, a stray character, an empty file. Every write to
+// runner.json reads it first and writes back what it read plus a change, so
+// reading this as {} rewrote the file with almost nothing in it (accounts,
+// pools, experiments gone) and a new runner id, which Convex then took for a
+// new runner (9 Nov review). Now nothing writes it until it reads again,
+// and the runner won't start (main.ts).
+export class RunnerJsonError extends Error {
+  readonly file: string;
+  readonly problem: string;
+  constructor(file: string, problem: string) {
+    super(`${file} isn't valid JSON, so the runner won't start or change it until it is: ${problem}. Fix it by hand, or move it aside to start afresh.`);
+    this.name = 'RunnerJsonError';
+    this.file = file;
+    this.problem = problem;
+  }
+}
+
+// What's wrong with JSON that didn't parse, in words that never quote it:
+// V8's message can carry a stretch of the file ("Unexpected token '}',
+// "...secret..." is not valid JSON"), and this goes to the log, an RPC
+// error and, through a logged warning, Sentry. Only its generic part and a
+// line and column worked out here.
+export function jsonProblem(text: string, error: unknown): string {
+  if (!text.trim()) return 'it is empty';
+  const message = error instanceof Error ? error.message : '';
+  const at = /^(.*?) in JSON at position (\d+)/.exec(message);
+  if (at && !/["']/.test(at[1].replace(/'[,}\]:]'/g, ''))) {
+    const position = Number(at[2]);
+    const before = text.slice(0, position);
+    const line = before.split('\n').length;
+    const column = position - before.lastIndexOf('\n');
+    return `${at[1].charAt(0).toLowerCase()}${at[1].slice(1)}, at line ${line}, column ${column}`;
+  }
+  if (message.startsWith('Unexpected end of JSON input')) return 'it ends partway through';
+  return "it isn't valid JSON (a trailing comma, a missing quote or bracket?)";
+}
+
+// The text of the last runner.json each home read cleanly in this process,
+// for the read-only lookups below while the file is broken mid-run. Text,
+// parsed again for each caller, so none can change another's copy (and a
+// structuredClone of a deeply nested file overflowed the stack).
+const lastGoodRunnerJson = new Map<string, string>();
+
+// runner.json, or {} when there's none yet. Throws RunnerJsonError when it's
+// there but broken, so a caller that writes it back can't wipe it.
 export function readRunnerJson(home: string): RunnerJson {
+  const file = path.join(home, 'runner.json');
+  let text: string;
   try {
-    return JSON.parse(fs.readFileSync(path.join(home, 'runner.json'), 'utf8')) as RunnerJson;
-  } catch {
-    return {};
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      // A link whose target has gone is a runner.json that's there, not a
+      // first run: reading it as {} made a new runner id and replaced the
+      // link with a plain file.
+      let link = false;
+      try {
+        link = fs.lstatSync(file).isSymbolicLink();
+      } catch {
+        // no file and no link: a first run
+      }
+      if (link) throw new RunnerJsonError(file, "it's a link to a file that isn't there");
+      return {};
+    }
+    throw new RunnerJsonError(file, `it can't be read (${code ?? 'error'})`);
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    throw new RunnerJsonError(file, jsonProblem(text, e));
+  }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) throw new RunnerJsonError(file, 'it holds JSON, but not an object in { }');
+  lastGoodRunnerJson.set(home, text);
+  return json as RunnerJson;
+}
+
+// For lookups that only read (an experiment's switch, a default), so a file
+// broken while the runner is up doesn't make each of them throw: the last
+// copy that read cleanly, or {} if none has. Never write back what this
+// returns; use readRunnerJson for that.
+export function peekRunnerJson(home: string): RunnerJson {
+  try {
+    return readRunnerJson(home);
+  } catch (e) {
+    if (!(e instanceof RunnerJsonError)) throw e;
+    const last = lastGoodRunnerJson.get(home);
+    return last === undefined ? {} : (JSON.parse(last) as RunnerJson);
   }
 }
 
 export function writeRunnerJson(home: string, data: RunnerJson): void {
-  atomicWriteFileSync(path.join(home, 'runner.json'), JSON.stringify(data, null, 2) + '\n');
+  // Throws on a broken file rather than writing over it, whatever the
+  // caller read (or didn't) first. An edit that lands in the moment between
+  // this read and the rename below can still be replaced; nothing short of
+  // a lock every editor honours closes that.
+  readRunnerJson(home);
+  const text = JSON.stringify(data, null, 2) + '\n';
+  atomicWriteFileSync(path.join(home, 'runner.json'), text);
+  lastGoodRunnerJson.set(home, text);
 }
 
 // The app finds the runner through runner.json, so it always names the port
@@ -227,11 +364,14 @@ export function adoptOldNames(env: NodeJS.ProcessEnv): void {
 }
 adoptOldNames(process.env);
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+// `readOnly`: a broken runner.json reads as {} instead of throwing, for a
+// tb command that only looks (tb logs, to see why the runner won't start).
+// Nothing loaded that way may write runner.json.
+export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { readOnly?: boolean } = {}): Config {
   adoptOldNames(env);
   // THREADBEAR_DATA_DIR is the name the Mac app uses for the same override.
   const home = path.resolve(expandHome(env.THREADBEAR_HOME || env.THREADBEAR_DATA_DIR || defaultHome()));
-  const json = readRunnerJson(home);
+  const json = opts.readOnly ? peekRunnerJson(home) : readRunnerJson(home);
   const port = Number(env.THREADBEAR_PORT || json.port || DEFAULT_PORT);
   const idleMs = env.THREADBEAR_IDLE_MS
     ? Number(env.THREADBEAR_IDLE_MS)
@@ -255,6 +395,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       model: nonEmpty(json.defaults?.model),
       ...(models ? { models } : {}),
       ...(efforts ? { efforts } : {}),
+      ...((m) => (m ? { permissionMode: m } : {}))(defaultModeOf(json.defaults?.permissionMode)),
     },
     claudeMainDir: expandHome(env.THREADBEAR_CLAUDE_MAIN_DIR || '~/.claude'),
     claudeMainJson: expandHome(env.THREADBEAR_CLAUDE_MAIN_JSON || '~/.claude.json'),
@@ -267,9 +408,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // On unless runner.json turns it off (2 Nov: Mike found it the right
     // balance, and it's no longer in Settings).
     oneReply: json.oneReply !== false,
-    ...(json.releases?.publish === true ? { releases: { publish: true, ...(typeof json.releases.signingKey === 'string' ? { signingKey: expandHome(json.releases.signingKey) } : {}) } } : {}),
+    labReview: json.labReview !== false,
+    // On for everyone since 10 Nov 2026, after a few days as an experiment
+    // on Mike's Mac; Settings turns it off for anyone who'd rather.
+    keepAwake: json.keepAwake !== false,
+    ...(json.releases?.publish === true ? { releases: { publish: true, ...(typeof json.releases.signingKey === 'string' ? { signingKey: expandHome(json.releases.signingKey) } : {}), ...(typeof json.releases.signingProvider === 'string' ? { signingProvider: expandHome(json.releases.signingProvider) } : {}) } } : {}),
     models: modelSettingsFrom(json),
     ...(codexPath ? { codexPath: expandHome(codexPath) } : {}),
+    ...(nonEmpty(json.cursorPath) ? { cursorPath: expandHome(nonEmpty(json.cursorPath)!) } : {}),
+    ...(nonEmpty(json.opencodePath) ? { opencodePath: expandHome(nonEmpty(json.opencodePath)!) } : {}),
     codexArgs: Array.isArray(json.codexArgs) ? json.codexArgs.filter((a): a is string => typeof a === 'string') : [],
     codexMainDir: expandHome(env.THREADBEAR_CODEX_MAIN_DIR || '~/.codex'),
     tokenStatsLimitsFile: expandHome(
@@ -288,21 +435,38 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 }
 
 // THREADBEAR_CONNECTORS_URL wins (empty or "off" turns it off, for tests),
-// then runner.json, then the main login's `connectors` MCP server.
-function connectorsConfig(raw: RunnerJson['connectors'], env: NodeJS.ProcessEnv, claudeJson: string): Pick<Config, 'connectorsUrl' | 'connectorsClient'> {
+// then runner.json, then the main login's `connectors` MCP server. The
+// gateway's calls carry its token, so a URL that isn't https (or plain
+// http to this Mac) leaves it off rather than falling back on the next.
+function connectorsConfig(raw: RunnerJson['connectors'], env: NodeJS.ProcessEnv, claudeJson: string): Pick<Config, 'connectorsUrl' | 'connectorsClient' | 'connectorsRefused'> {
   const fromEnv = env.THREADBEAR_CONNECTORS_URL;
-  const url = fromEnv !== undefined ? (fromEnv.trim() && fromEnv.trim() !== 'off' ? gatewayBase(fromEnv.trim()) : undefined) : findGateway(raw, claudeJson);
+  const found = fromEnv !== undefined ? (fromEnv.trim() && fromEnv.trim() !== 'off' ? { url: fromEnv.trim(), from: 'THREADBEAR_CONNECTORS_URL' } : undefined) : gatewayUrlFrom(raw, claudeJson);
+  if (!found) return {};
+  const problem = credentialUrlProblem(found.url);
+  if (problem) return { connectorsRefused: `${found.from} ${problem}` };
+  const url = gatewayBase(found.url);
   if (!url) return {};
   const client = fromEnv !== undefined ? undefined : findGatewayClient(raw, claudeJson);
   return { connectorsUrl: url, ...(client ? { connectorsClient: client } : {}) };
 }
 
 // THREADBEAR_SYNC=off wins over runner.json; THREADBEAR_SYNC_URL points a
-// test or dev runner at its own deployment.
+// test or dev runner at its own deployment. Every post carries the runner
+// key and thread text, so a URL that isn't https (or plain http to this
+// Mac, a local backend) isn't used: sync stays off and says why, rather
+// than falling back on runner.json's.
 function syncConfig(raw: RunnerJson['sync'], env: NodeJS.ProcessEnv): Config['sync'] {
-  const url = nonEmpty(env.THREADBEAR_SYNC_URL) ?? nonEmpty(raw?.url);
+  const fromEnv = nonEmpty(env.THREADBEAR_SYNC_URL);
+  const url = fromEnv ?? nonEmpty(raw?.url);
   const out: Config['sync'] = { enabled: env.THREADBEAR_SYNC === 'off' ? false : raw?.enabled !== false };
-  if (url) out.url = url;
+  const problem = url ? credentialUrlProblem(url) : undefined;
+  if (problem) out.urlRefused = `${fromEnv ? 'THREADBEAR_SYNC_URL' : 'sync.url in runner.json'} ${problem}`;
+  else if (url) out.url = url;
+  // Where the website is, for a self-hosted backend, which serves it on a
+  // port of its own (docs/self-hosting.md). A cloud deployment leaves it
+  // out: its site is the .convex.site twin of url.
+  const site = nonEmpty(raw?.site);
+  if (site) out.site = site;
   const name = nonEmpty(raw?.name);
   if (name) out.name = name;
   const runnerId = nonEmpty(raw?.runnerId);
@@ -359,6 +523,7 @@ function cliUpdatesConfig(raw: Partial<CliUpdatesConfig> | undefined, envValue: 
     checkMinutes: count(raw?.checkMinutes, DEFAULT_CLI_UPDATES.checkMinutes, 1),
     // Fewer than 2 would leave nothing for "Go back".
     keepCodexVersions: count(raw?.keepCodexVersions, DEFAULT_CLI_UPDATES.keepCodexVersions, 2),
+    extra: extraUpdatesFrom(raw?.extra, envValue),
   };
 }
 

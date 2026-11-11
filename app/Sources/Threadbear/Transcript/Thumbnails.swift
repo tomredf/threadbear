@@ -1,6 +1,8 @@
 import AppKit
 import ImageIO
 import Quartz
+import ThreadbearCore
+import UniformTypeIdentifiers
 
 /// Decodes image thumbnails off the main thread at the size they're drawn,
 /// and keeps them in an `NSCache`.
@@ -314,15 +316,30 @@ final class ImageGridView: NSView {
         open(index)
     }
 
+    #if DEBUG
+    /// The tile's files, for the scripted app's `tile`.
+    var debugPaths: [String] { paths }
+    #endif
+
     /// Quick Look on one picture, for a click on its tile or its chip in
     /// the words. False when there's nothing here yet to look at.
     @discardableResult
     func open(_ index: Int) -> Bool {
-        guard let path = localPath(index) else { return false }
+        guard let path = localPath(index), quickLooks(path) else { return false }
         // Quick Look steps through the pictures there are copies of.
-        let shown = paths.indices.compactMap { localPath($0) }
+        let shown = paths.indices.compactMap { localPath($0) }.filter(quickLooks)
         QuickLookCoordinator.shared.show(paths: shown, index: shown.firstIndex(of: path) ?? 0, from: self)
         return true
+    }
+
+    /// A tile goes to Quick Look only when it's really a picture: Quick
+    /// Look's Open with button would hand anything else (a `.love` game
+    /// or a `.command` posing as one) to its app (Codex review, 7 Nov).
+    private func quickLooks(_ path: String) -> Bool {
+        guard UTType(filenameExtension: (path as NSString).pathExtension)?.conforms(to: .image) == true,
+              ThumbnailLoader.decode(path: path, maxPixels: 64) != nil else { return false }
+        let app = OpenGate.appFor(URL(fileURLWithPath: path))
+        return !LinkPolicy.isCodeRunner(bundleId: app.flatMap(OpenGate.appBundleId))
     }
 
     override func resetCursorRects() {

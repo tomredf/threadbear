@@ -29,6 +29,8 @@ struct ComposerView: View {
     static var padding: CGFloat { zoomed(14) }
 
     private var draftKey: String { thread?.id ?? "new" }
+    /// Messages sent from this box, for the send arrow's nudge.
+    @State private var sends = 0
 
     var body: some View {
         // Normalized, so a picture added from outside the box (an ask's
@@ -41,10 +43,15 @@ struct ComposerView: View {
         let picks = thread.map { app.picks(for: $0) } ?? [:]
         // So are follow-ups ticked on a done card.
         let followUps = thread.map { app.pickedFollowUps(threadId: $0.id) } ?? FollowUpPicks()
-        let canSend = !picks.isEmpty || !followUps.isEmpty || ComposerChips.canSend(text: draft.wrappedValue.text, imageCount: draft.wrappedValue.images.count)
+        let canSend = Self.canSend(draft.wrappedValue, picks: picks, followUps: followUps)
         // A new thread on its way: what was sent stays, greyed and locked,
         // until the runner has made the thread.
         let creating = thread == nil && app.creatingThread
+        // On its way to another machine: anything typed or answered now
+        // could land on the wrong side of the move, so the box and the card
+        // wait until it's there. Cancel Move, or a failed move, gives them back.
+        let moving = thread?.moving?.ended == false
+        let locked = creating || moving
         // The open card sits at the top of the box (ComposerCard), not
         // while a message is being edited: the edit is a reply of its own.
         let cardRow = thread.flatMap { thread in app.editing[thread.id] == nil ? session?.openCard : nil }
@@ -52,6 +59,7 @@ struct ComposerView: View {
         let cardCollapsed = needsYou && thread.map { app.collapsedCards[$0.id] == cardRow?.seq } == true
         VStack(alignment: .leading, spacing: 0) {
         if let thread {
+            RecapBox(thread: thread)
             RefusalOffer(thread: thread)
         }
         // The folder's actions (patches), on shelves sitting on the box's
@@ -64,10 +72,16 @@ struct ComposerView: View {
                 .padding(.bottom, -0.5)
                 .zIndex(1)
         }
-        // The box: the open card over a line, then the message.
+        // The box: the limit box and the open card, each over a line, then
+        // the message.
         VStack(alignment: .leading, spacing: 0) {
+        if let thread, !moving {
+            LimitBox(thread: thread, padding: Self.padding)
+        }
         if let cardRow, let controller {
-            ComposerCard(row: cardRow, collapsed: cardCollapsed, controller: controller)
+            ComposerCard(row: cardRow, threadId: thread?.id, collapsed: cardCollapsed, controller: controller)
+                .allowsHitTesting(!moving)
+                .opacity(moving ? 0.5 : 1)
                 .padding(.horizontal, Self.padding)
                 .padding(.top, zoomed(8))
                 .padding(.bottom, zoomed(10))
@@ -85,8 +99,8 @@ struct ComposerView: View {
             }
             if !draft.wrappedValue.images.isEmpty || importing > 0 {
                 AttachmentStrip(images: draft.wrappedValue.images, importing: importing) { removePicture(at: $0, from: draft) }
-                    .disabled(creating)
-                    .opacity(creating ? 0.5 : 1)
+                    .disabled(locked)
+                    .opacity(locked ? 0.5 : 1)
             }
             ComposerTextField(
                 draft: draft,
@@ -94,24 +108,25 @@ struct ComposerView: View {
                 focusTrigger: app.focusRequests[draftKey] ?? 0,
                 placeholder: placeholder(picks, followUps: followUps, needsYou: needsYou),
                 onSend: { send() },
-                onReturnWhenEmpty: { returnWhenEmpty(draft.wrappedValue) },
-                pictures: ComposerTextView.Pictures(allowed: { picturesAllowed() }, importOne: { await importPicture($0) }),
+                onReturnWhenEmpty: { command in returnWhenEmpty(draft.wrappedValue, command: command) },
+                pictures: ComposerTextView.Pictures(allowed: { !moving && picturesAllowed() }, importOne: { await importPicture($0) }),
                 handle: handle,
                 onEscape: { cancelEdit() },
                 onPaletteKey: { paletteKey($0, text: draft.wrappedValue.text) },
-                editable: !creating
+                editable: !locked
             )
             .frame(height: height)
-            .opacity(creating ? 0.5 : 1)
+            .opacity(locked ? 0.5 : 1)
             ComposerControls(
                 thread: thread,
                 running: thread?.status.isBusy == true,
-                canSend: canSend,
+                canSend: canSend && !moving,
                 sending: creating,
                 onAttach: { chooseImages(for: draft) },
                 onSend: { send() },
                 onSchedule: { app.newSchedule(from: thread, draftKey: draftKey) }
             )
+            .environment(\.sendNudges, sends)
         }
         .padding(Self.padding)
         }
@@ -127,30 +142,19 @@ struct ComposerView: View {
         // panel was picked up (Codex's review, 6 Nov).
         .onAppear { if !isGhost { controller?.composerHandle = handle } }
         }
-        // The slash command palette, over the transcript just above the box.
+        // The slash command palette, in a panel of its own just above the
+        // box (SlashPalettePanel): drawn here it was cut off at the pane.
         .overlay(alignment: .top) {
-            if let thread, let query = paletteQuery(draft.wrappedValue.text) {
-                let height = paletteHeight
-                SlashPaletteView(
-                    commands: app.slashCommands[thread.id],
-                    query: query,
-                    provider: thread.provider,
-                    recent: app.recentSlashCommands,
-                    state: $palette,
-                    current: paletteCurrent(thread),
-                    onFill: { pick($0, run: false) },
-                    onRun: { pick($0, run: true) },
-                    // Another Mac's runner found the file there, not here.
-                    onOpen: app.runnerName(of: thread) == nil ? { path in
-                        palette.closedAt = draft.wrappedValue.text
-                        app.preview(path: path, in: thread)
-                    } : nil,
-                    height: height
-                )
-                // Its height is fixed, so lifting it by that sits it just above.
-                .offset(y: -(height + zoomed(8)))
-                .onAppear { app.loadSlashCommands(thread.id) }
-            }
+            SlashPaletteHost(
+                content: paletteContent(draft),
+                autoHeight: paletteHeight,
+                layout: Binding(get: { app.slashPaletteLayout }, set: { app.slashPaletteLayout = $0 })
+            )
+            .frame(height: 1)
+        }
+        .task(id: paletteQuery(draft.wrappedValue.text) != nil ? paletteListKey : nil) {
+            guard paletteQuery(draft.wrappedValue.text) != nil else { return }
+            if let thread { app.loadSlashCommands(thread.id) } else { app.loadNewThreadSlashCommands() }
         }
         // Esc closed the palette at that text only: any change reopens it,
         // even back to the same words later.
@@ -180,28 +184,107 @@ struct ComposerView: View {
             .fill(dark ? Color.primary.opacity(0.085) : Color.white)
             .shadow(color: .black.opacity(dark ? 0 : 0.08), radius: zoomed(14), y: zoomed(4))
             .overlay(shape.strokeBorder(attention ? Color(nsColor: .controlAccentColor) : Color(nsColor: .separatorColor), lineWidth: attention ? 1 : 0.5))
+            // Fades up with a card settling in, rather than snapping on. Not
+            // going to a thread that's waiting already: this box is reused
+            // from thread to thread, and those change over at once.
+            .animation(session?.arrivingCard != nil ? .easeOut(duration: 0.2) : nil, value: attention)
             .contentShape(shape)
             .onTapGesture { app.focusComposer(draftKey) }
     }
 
-    /// What's typed while the palette is open: the command so far. Not
-    /// in a new thread (it has no CLI yet), and not once Esc closed it at
+    /// What's typed while the palette is open: the command so far, in a
+    /// new thread too (folders.commands), and not once Esc closed it at
     /// this text.
     private func paletteQuery(_ text: String) -> String? {
-        guard thread != nil, palette.closedAt != text else { return nil }
-        return SlashPalette.query(in: text)
+        paletteTyped(text)?.query
+    }
+
+    /// The command being typed as the message's last word, at its start or
+    /// partway through it (David, 9 Nov 2026: skills named mid-message).
+    private func paletteTyped(_ text: String) -> SlashPalette.Typed? {
+        guard palette.closedAt != text else { return nil }
+        return SlashPalette.typed(in: text)
+    }
+
+    /// The palette's list for what's typed: partway through a message only
+    /// the skills the agent can run there.
+    private func paletteCommands(_ typed: SlashPalette.Typed) -> [SlashCommand]? {
+        guard let all = app.slashCommands[paletteListKey] else { return nil }
+        return typed.midMessage ? SlashPalette.midMessage(all) : all
     }
 
     /// About half the window: read when the palette draws, which it does
     /// with each key, so a resized window is caught on the next one.
+    /// One he dragged it to, kept to what this window has room for.
     private var paletteHeight: CGFloat {
-        let window = handle.textView?.window?.contentLayoutRect.height ?? NSApp.keyWindow?.contentLayoutRect.height ?? 600
+        let window = paletteWindow.height
+        if let chosen = app.slashPaletteLayout.height { return SlashPalette.Layout.height(chosen, window: window) }
         return SlashPalette.height(window: window, least: zoomed(300), most: zoomed(560))
     }
 
-    /// What /model and /effort would change, as the thread has it now.
-    private func paletteCurrent(_ thread: ThreadSummary) -> [String: String] {
+    private var paletteWindow: CGSize {
+        handle.textView?.window?.contentLayoutRect.size ?? NSApp.keyWindow?.contentLayoutRect.size ?? CGSize(width: 1200, height: 800)
+    }
+
+    /// The palette for what's typed, or nil when it's closed.
+    private func paletteContent(_ draft: Binding<Draft>) -> SlashPaletteView? {
+        let text = draft.wrappedValue.text
+        guard let typed = paletteTyped(text) else {
+            #if DEBUG
+            AppDump.slashPalette = nil
+            #endif
+            return nil
+        }
+        let commands = paletteCommands(typed)
+        // Partway through a message the palette only opens on a match, so
+        // a slash in other words ("the /tmp folder") doesn't get in the way.
+        if typed.midMessage, SlashPalette.matches(commands ?? [], query: typed.query, category: .all, recent: []).isEmpty {
+            #if DEBUG
+            AppDump.slashPalette = nil
+            #endif
+            return nil
+        }
+        #if DEBUG
+        // For `dump`: what the palette shows (the view's own state lives here).
+        AppDump.slashPalette = AppDump.paletteInfo(commands: commands, query: typed.query, provider: thread?.provider ?? app.newThreadProviderId, recent: app.recentSlashCommands, state: palette, current: paletteCurrent(thread), canOpenFile: thread.map { app.runnerName(of: $0) == nil } ?? false)
+        #endif
+        return SlashPaletteView(
+            commands: commands,
+            query: typed.query,
+            provider: thread?.provider ?? app.newThreadProviderId,
+            recent: app.recentSlashCommands,
+            state: $palette,
+            current: paletteCurrent(thread),
+            onFill: { pick($0, run: false) },
+            // A skill named partway through a message isn't sent on its own.
+            onRun: { pick($0, run: !typed.midMessage) },
+            midMessage: typed.midMessage,
+            // Another Mac's runner found the file there, not here; a new
+            // thread has no side pane to show it in yet.
+            onOpen: thread.flatMap { thread in app.runnerName(of: thread) == nil ? { path in
+                palette.closedAt = draft.wrappedValue.text
+                app.preview(path: path, in: thread)
+            } : nil },
+            layout: Binding(get: { app.slashPaletteLayout }, set: { app.slashPaletteLayout = $0 })
+        )
+    }
+
+    /// Where the palette's list is kept: the thread's, or for a new
+    /// thread its login and folder's.
+    private var paletteListKey: String { thread?.id ?? app.newThreadCommandsKey }
+
+    /// What /model and /effort would change, as the thread has it now, or
+    /// as a new thread would start.
+    private func paletteCurrent(_ thread: ThreadSummary?) -> [String: String] {
         var out: [String: String] = [:]
+        guard let thread else {
+            let account = app.draftLogins.account(app.newThreadAccountId)
+            if let model = app.newThreadModel ?? account?.defaultModel {
+                out["model"] = ComposerChips.modelTitle(model, choices: account?.models ?? []) + (app.newThreadModel == nil ? ", the default" : "")
+            }
+            if let level = app.newThreadEffort { out["effort"] = ComposerChips.effortTitle(level) }
+            return out
+        }
         let account = app.logins(for: thread)?.account(thread.accountId)
         if let model = thread.model ?? thread.modelInUse ?? account?.defaultModel {
             out["model"] = ComposerChips.modelTitle(model, choices: account?.models ?? []) + (thread.model == nil ? ", the default" : "")
@@ -215,27 +298,39 @@ struct ComposerView: View {
     /// Arrows, Tab, Return and Esc while the palette is open. False lets
     /// the box have the key as usual.
     private func paletteKey(_ key: PaletteKey, text: String) -> Bool {
-        guard let thread, let query = paletteQuery(text) else { return false }
-        let matches = SlashPalette.matches(app.slashCommands[thread.id] ?? [], query: query, category: palette.category, recent: app.recentSlashCommands)
+        guard let typed = paletteTyped(text) else { return false }
+        let commands = paletteCommands(typed) ?? []
+        // Partway through a message, a closed palette leaves the keys alone.
+        if typed.midMessage, SlashPalette.matches(commands, query: typed.query, category: .all, recent: []).isEmpty { return false }
+        let matches = SlashPalette.matches(commands, query: typed.query, category: palette.category, recent: app.recentSlashCommands)
         // Return with nothing to pick sends what's typed, as words.
         if key == .enter, matches.isEmpty { return false }
         if let (command, run) = SlashPaletteView.handle(key, matches: matches, state: &palette, text: text) {
-            pick(command, run: run)
+            pick(command, run: run && !typed.midMessage)
         }
         return true
     }
 
-    /// Puts the command in the box: to send now, or with a space after it
-    /// for its arguments. Through the text view, so it's one undo.
+    /// Puts the command in the box in place of what was typed for it: to
+    /// send now, or with a space after it for its arguments (or, partway
+    /// through a message, the words after it). Through the text view, so
+    /// it's one undo.
     private func pick(_ command: SlashCommand, run: Bool) {
         app.recentSlashCommands = SlashPalette.used(command.name, recent: app.recentSlashCommands)
+        let current = app.drafts[draftKey]?.normalized.text ?? ""
+        // Counted from the end: the text view's string can differ earlier
+        // on (a picture's chip), never in the last word.
+        let typedLength = SlashPalette.typed(in: current).map { current.utf16.count - $0.start } ?? current.utf16.count
         palette = PaletteState()
         let text = SlashPalette.fill(command, forArguments: !run)
         if let textView = handle.textView {
-            textView.insertText(text, replacementRange: NSRange(location: 0, length: (textView.string as NSString).length))
+            let length = (textView.string as NSString).length
+            let cut = min(typedLength, length)
+            textView.insertText(text, replacementRange: NSRange(location: length - cut, length: cut))
             textView.window?.makeFirstResponder(textView)
         } else {
-            app.drafts[draftKey, default: Draft()].text = text
+            let kept = String(current.utf16.dropLast(typedLength)) ?? ""
+            app.drafts[draftKey, default: Draft()].text = kept + text
         }
         if run { send() }
     }
@@ -251,6 +346,7 @@ struct ComposerView: View {
     /// else answer has its own box on the card. Under asks with none
     /// picked, it's the way to answer in other words.
     private func placeholder(_ picks: [Int: Int], followUps: FollowUpPicks, needsYou: Bool) -> String {
+        if let moving = thread?.moving, !moving.ended { return moving.line + "…" }
         if let thread, app.editing[thread.id] != nil { return "Your message…" }
         if !picks.isEmpty || !followUps.isEmpty { return "Add anything else…" }
         return needsYou ? "Or say something else…" : "Message"
@@ -259,18 +355,34 @@ struct ComposerView: View {
     /// AppModel empties the box, and puts the draft back if it isn't sent.
     /// Picked answers go with it.
     private func send() {
+        // Return still reaches here with the box locked.
+        if thread?.moving?.ended == false { return }
+        // Return in an empty box comes here too, with nothing to go.
+        if Self.canSend((app.drafts[draftKey] ?? Draft()).normalized,
+                        picks: thread.map { app.picks(for: $0) } ?? [:],
+                        followUps: thread.map { app.pickedFollowUps(threadId: $0.id) } ?? FollowUpPicks()) {
+            sends &+= 1
+        }
         app.send(threadId: thread?.id)
     }
 
-    /// Return with nothing typed sends picked answers on their own, or
-    /// else allows the sole approval (below).
-    private func returnWhenEmpty(_ draft: Draft) -> Bool {
+    private static func canSend(_ draft: Draft, picks: [Int: Int], followUps: FollowUpPicks) -> Bool {
+        !picks.isEmpty || !followUps.isEmpty || ComposerChips.canSend(text: draft.text, imageCount: draft.images.count)
+    }
+
+    /// Return with nothing typed sends picked answers on their own (once
+    /// every ask has one, or with ⌘), or else allows the sole approval (below).
+    private func returnWhenEmpty(_ draft: Draft, command: Bool) -> Bool {
         // An edit with only pictures left still sends; an empty one does nothing.
         if let thread, app.editing[thread.id] != nil {
             if !draft.images.isEmpty { send() }
             return true
         }
         if let thread, !app.picks(for: thread).isEmpty || !app.pickedFollowUps(threadId: thread.id).isEmpty {
+            // Picks with asks still unanswered: on to the next of those, as
+            // in a Something else box; ⌘Return sends them as they are.
+            if !app.picks(for: thread).isEmpty, !command,
+               controller?.returnWithUnanswered() == true { return true }
             send()
             return true
         }
@@ -294,12 +406,11 @@ struct ComposerView: View {
         return true
     }
 
-    /// Whether pictures can go in this box, saying why not when they can't:
-    /// a picture this Mac's runner keeps would be a path another runner
-    /// hasn't got.
+    /// Whether pictures can go in this box, saying why not when they can't
+    /// (only over the direct link to another runner: `picturesRefusal`).
     private func picturesAllowed() -> Bool {
-        if let name = thread.flatMap(app.runnerName(of:)) ?? (thread == nil ? app.newThreadRunner?.name : nil) {
-            app.errorMessage = "Pictures can't go to \(name) from this Mac yet."
+        if let why = app.picturesRefusal(for: thread) {
+            app.errorMessage = why
             return false
         }
         return true
@@ -337,15 +448,15 @@ struct ComposerView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [.image]
+        panel.allowedContentTypes = ComposerTextView.attachableTypes
         panel.prompt = "Add"
         let finish = { (response: NSApplication.ModalResponse) in
             guard response == .OK else { return }
-            // Chips where the cursor was, as a paste would put them.
+            // Where the cursor was, as a paste would put them.
             if let textView = handle.textView {
-                textView.insertPictures(panel.urls)
+                textView.insertChosenFiles(panel.urls)
             } else {
-                attach(panel.urls, to: draft)
+                attach(panel.urls.filter { !PreviewRules.isMarkdown($0.path) }, to: draft)
             }
         }
         if let window = NSApp.keyWindow {
@@ -583,7 +694,7 @@ struct ComposerTextField: NSViewRepresentable {
     var placeholder: String
     var onSend: () -> Void
     /// Return with nothing typed: true if it did something.
-    var onReturnWhenEmpty: () -> Bool = { false }
+    var onReturnWhenEmpty: (_ command: Bool) -> Bool = { _ in false }
     var pictures: ComposerTextView.Pictures?
     var handle: ComposerHandle?
     /// Esc: true if it did something (left an edit).
@@ -739,7 +850,12 @@ final class ComposerTextView: NSTextView {
     /// composer: lookups for the composer skip it.
     var inAnswerBox = false
     var onSend: (() -> Void)?
-    var onReturnWhenEmpty: (() -> Bool)?
+    /// With whether ⌘ was held.
+    var onReturnWhenEmpty: ((_ command: Bool) -> Bool)?
+    /// An answer box's Return, with whether ⌘ was held, in place of
+    /// `onSend` and `onReturnWhenEmpty`: there Return goes on to the next
+    /// unanswered ask and only ⌘Return always sends (AskAnswerBox).
+    var onAnswerReturn: ((_ command: Bool) -> Void)?
     var onPaletteKey: ((PaletteKey) -> Bool)?
     var onEscape: (() -> Bool)?
     /// Pictures pasted or dropped in an ask's box, which keeps them beside
@@ -907,7 +1023,9 @@ final class ComposerTextView: NSTextView {
         if isReturn, !hasMarkedText() {
             if event.modifierFlags.contains(.shift) || event.modifierFlags.contains(.option) {
                 insertLineContinuingList()
-            } else if string.isEmpty, onReturnWhenEmpty?() == true {
+            } else if let onAnswerReturn {
+                onAnswerReturn(event.modifierFlags.contains(.command))
+            } else if string.isEmpty, onReturnWhenEmpty?(event.modifierFlags.contains(.command)) == true {
                 // Allowed the waiting approval.
             } else {
                 onSend?()
@@ -950,9 +1068,21 @@ final class ComposerTextView: NSTextView {
         nextResponder?.tryToPerform(#selector(NSResponder.cancelOperation(_:)), with: sender)
     }
 
+    /// Where Paste reads from: the clipboard, or a test's own board.
+    var pasteSource: NSPasteboard = .general
+
     override func paste(_ sender: Any?) {
-        if takeImages(from: .general) { return }
+        if takeImages(from: pasteSource) { return }
         super.paste(sender)
+    }
+
+    /// A plain text view only offers Paste when the clipboard has words (or
+    /// another type it reads), so a screenshot copied with ⌘⌃⇧4, which is
+    /// only HEIC and TIFF, left Paste greyed out and ⌘V did nothing
+    /// (Behrooz, 7 Nov). Pictures and files paste too.
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(paste(_:)), isEditable, hasFiles(pasteSource) { return true }
+        return super.validateUserInterfaceItem(item)
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -1024,13 +1154,26 @@ final class ComposerTextView: NSTextView {
         (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType?.conforms(to: .image)) == true
     }
 
+    /// Image types a clipboard carries as they are, best first. Only the
+    /// types it declares count: asking for one it doesn't have (PNG from a
+    /// screenshot's HEIC and TIFF) makes macOS convert it, about 84 MB of
+    /// TIFF for one screen, and this runs every time a menu opens.
+    static let imageTypes: [NSPasteboard.PasteboardType] = [.png, NSPasteboard.PasteboardType("public.heic"), NSPasteboard.PasteboardType("public.jpeg"), .tiff]
+
+    static func imageType(_ pasteboard: NSPasteboard) -> NSPasteboard.PasteboardType? {
+        let types = Set(pasteboard.types ?? [])
+        return imageTypes.first(where: types.contains)
+    }
+
+    /// Cheap: types only, no data read.
     private func hasFiles(_ pasteboard: NSPasteboard) -> Bool {
-        !fileURLs(pasteboard).isEmpty || pasteboard.data(forType: .png) != nil || pasteboard.data(forType: .tiff) != nil
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        return pasteboard.canReadObject(forClasses: [NSURL.self], options: options) || Self.imageType(pasteboard) != nil
     }
 
     /// Files pasted or dropped. Pictures go to `media.import` as chips;
-    /// raw image data (a screenshot on the clipboard) is written to a temp
-    /// PNG first. Any other file (a video, a PDF, a folder) goes in as its
+    /// raw image data (a screenshot on the clipboard) is written to a file
+    /// first. Any other file (a video, a PDF, a folder) goes in as its
     /// full path, for the agent to open where it is: nothing's copied, so
     /// a big one costs nothing, except one macOS is about to take back (a
     /// floating thumbnail's), where an APFS clone keeps it for free.
@@ -1061,19 +1204,23 @@ final class ComposerTextView: NSTextView {
         }
         // Text with an image flavour (rich text from a browser) stays text.
         if pasteboard.string(forType: .string) != nil { return false }
-        guard let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) else { return false }
-        let png: Data?
-        if pasteboard.data(forType: .png) != nil {
-            png = data
-        } else {
-            png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:])
+        // PNG, HEIC (a screenshot copied with ⌘⌃⇧4) and JPEG go in as they
+        // are, as the runner takes them; TIFF goes in as PNG.
+        guard let type = Self.imageType(pasteboard), let data = pasteboard.data(forType: type) else { return false }
+        let saved: Data?
+        let ext: String
+        switch type {
+        case .png: (saved, ext) = (data, "png")
+        case NSPasteboard.PasteboardType("public.heic"): (saved, ext) = (data, "heic")
+        case NSPasteboard.PasteboardType("public.jpeg"): (saved, ext) = (data, "jpeg")
+        default: (saved, ext) = (NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]), "png")
         }
-        guard let png else { return false }
+        guard let saved else { return false }
         let folder = DroppedFiles.keepFolder
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let url = folder.appendingPathComponent("pasted-\(UUID().uuidString.prefix(8)).png")
+        let url = folder.appendingPathComponent("pasted-\(UUID().uuidString.prefix(8)).\(ext)")
         do {
-            try png.write(to: url)
+            try saved.write(to: url)
             deliver([url], at: range)
             return true
         } catch {
@@ -1103,6 +1250,21 @@ final class ComposerTextView: NSTextView {
     /// screen recording) still reads as one path.
     static func pathText(for urls: [URL]) -> String {
         urls.map { "`\($0.standardizedFileURL.path)`" }.joined(separator: " ")
+    }
+
+    /// What Attach Image's picker lets you pick: pictures, and Markdown
+    /// files, which go in as their paths as a dropped one does.
+    static let attachableTypes: [UTType] = [.image]
+        + ["md", "markdown"].compactMap { UTType(filenameExtension: $0) }
+
+    /// Files picked from Attach Image, where the cursor is: pictures as
+    /// chips, anything else as its path, as a drop puts them.
+    func insertChosenFiles(_ urls: [URL]) {
+        let images = urls.filter(isImage)
+        let others = urls.filter { !isImage($0) }
+        var at: NSRange?
+        if !others.isEmpty { at = insertPaths(others, replacing: nil) }
+        if !images.isEmpty { deliver(images, at: at) }
     }
 
     /// `urls` as paths in place of `range` (the selection by default), with

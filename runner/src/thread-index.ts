@@ -36,14 +36,19 @@ export type IndexRow = {
   starredAt?: string;
   startedBy?: { kind: string; label: string; icon?: string; threadTitle?: string; why?: string };
   asked?: string;
+  recap?: string;
 };
 
 // What the Mac app gets (docs/protocol.md, "Other runners' threads").
-export type RemoteRunner = { id: string; name: string; icon?: string; online: boolean; lastSeenAt: string; rpcUrl?: string; tokenFile?: string };
-export type RemoteThread = IndexRow & { runnerId: string };
-export type RemoteThreads = { runners: RemoteRunner[]; threads: RemoteThread[] };
+export type RemoteRunner = { id: string; name: string; icon?: string; online: boolean; lastSeenAt: string; rpcUrl?: string; tokenFile?: string; followProblem?: string };
+// `moving`: set by the main Mac's runner for a move it knows of (main.ts
+// remoteMoving), never by the backend's rows.
+export type RemoteThread = IndexRow & { runnerId: string; moving?: import('./moves.ts').ThreadMoving };
+// `order`: Mike's runner order (backend API 58), every runner's id, this
+// one's too, for the app's Settings > Runners. Left out before it's heard.
+export type RemoteThreads = { runners: RemoteRunner[]; threads: RemoteThread[]; order?: string[] };
 
-type RawRunner = { runnerId: string; name: string; icon?: string; lastSeenAt: number; rpcUrl?: string };
+type RawRunner = { runnerId: string; name: string; icon?: string; lastSeenAt: number; rpcUrl?: string; followProblem?: string };
 type SinceRow = RemoteThread & { updatedMs?: number; deleted?: boolean };
 
 const FLUSH_MS = 1000;
@@ -59,7 +64,7 @@ const ONLINE_MS = 3 * 60_000;
 const WATCH_CHECK_MS = 15_000;
 const UNWATCH_AFTER_MS = 2 * 60_000;
 
-export function toIndexRow(t: ThreadSummary, withStartedBy = true, withStars = true, withAsked = true): IndexRow {
+export function toIndexRow(t: ThreadSummary, withStartedBy = true, withStars = true, withAsked = true, withRecap = true): IndexRow {
   const row: IndexRow = {
     threadId: t.id,
     title: t.title,
@@ -80,6 +85,8 @@ export function toIndexRow(t: ThreadSummary, withStartedBy = true, withStars = t
   // Changes only when Mike sends, which moves the status anyway, so it
   // costs no writes of its own.
   if (withAsked && t.asked) row.asked = t.asked;
+  // Changes only after a turn, which moves the status anyway.
+  if (withRecap && t.recap) row.recap = t.recap;
   if (withStartedBy && t.startedBy) {
     // Not the thread's id: only the row's tooltip uses this, by that title.
     const { kind, label, icon, threadTitle, why } = t.startedBy;
@@ -117,9 +124,12 @@ export class ThreadIndex {
     takesStars?: () => boolean;
     // Whether it knows `asked` (API 32).
     takesAsked?: () => boolean;
+    takesRecap?: () => boolean;
     // Whether the backend can answer with only the rows changed since the
     // last answer (API 29). Without it, every re-run reads every row.
     takesSince?: () => boolean;
+    // Whether the backend has the runner order for the main key (API 58).
+    takesOrder?: () => boolean;
     // Whether a Mac app is connected to this runner. Only an app shows the
     // other runners' threads, so with none there's nothing to watch them
     // for. Left out, they're always watched.
@@ -128,6 +138,8 @@ export class ThreadIndex {
     // then writes only what changed, and doesn't read every row to prune.
     seed?: () => { at: number; rows: Record<string, string>; removed?: string[]; archived?: boolean } | undefined;
     onSent?: () => void;
+    // A thread finishing on the release that handed over (sync.ts SyncDeps).
+    elsewhere?: (threadId: string) => boolean;
   };
   private running = false;
   private sent = new Map<string, string>(); // threadId -> writeKey as sent
@@ -141,6 +153,9 @@ export class ThreadIndex {
   private unlisten?: () => void;
   private unsubscribe?: () => void;
   private remote: RemoteThreads = { runners: [], threads: [] };
+  // Mike's runner order, watched with the other runners (API 58).
+  private order?: string[];
+  private unsubOrder?: () => void;
   // A backend before API 54 dropped a runner key's archived rows while this
   // remembered them as sent: they go once more, then this says so (snapshot).
   private archivedSent = false;
@@ -179,6 +194,14 @@ export class ThreadIndex {
       this.full = false;
       const here = new Set(this.deps.host.list(['inbox', 'snoozed', 'archived']).map((t) => t.id));
       for (const id of seed.removed ?? []) if (!here.has(id)) this.removed.add(id);
+      // One the file says is up whose thread isn't here (nor finishing on the
+      // release before): deleted while sync wasn't listening. A start from the
+      // file has no full write to drop it. Written again if it turns up.
+      for (const id of [...this.sent.keys()]) {
+        if (here.has(id) || this.deps.elsewhere?.(id)) continue;
+        this.sent.delete(id);
+        this.removed.add(id);
+      }
     }
     for (const t of this.deps.host.list(['inbox', 'snoozed', 'archived'])) this.mark(t);
     this.unlisten = this.deps.host.onNotification((n) => {
@@ -238,6 +261,7 @@ export class ThreadIndex {
     // What was heard before may be old by now: the tools wait for this watch's answer.
     this.answered = false;
     const failed = (e: Error) => this.watchFailed(e);
+    this.watchOrder();
     this.watchingSince = this.deps.takesSince?.() ?? false;
     if (this.watchingSince) {
       // A heartbeat re-runs only this small read; the rows are watched
@@ -258,12 +282,30 @@ export class ThreadIndex {
   private unwatch(): void {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    this.unsubOrder?.();
+    this.unsubOrder = undefined;
     this.unsubRows?.();
     this.unsubRows = undefined;
     this.rowsKey = undefined;
     this.since.clear();
     this.rows.clear();
     this.runnersHeard = [];
+  }
+
+  // One small row, re-run only when Mike moves a runner. A failure leaves
+  // the app's list in the order it had, so it's only logged.
+  private watchOrder(): void {
+    if (this.unsubOrder || !this.deps.subscribe || !this.deps.takesOrder?.()) return;
+    this.unsubOrder = this.deps.subscribe(
+      'sync:runnerOrder',
+      { key: this.deps.key },
+      (v) => {
+        this.order = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+        this.remote = { ...this.remote, order: this.order };
+        this.deps.publish?.({ method: 'remoteThreads.updated', params: this.withTokens(this.remote) });
+      },
+      (e) => this.deps.log.warn('the runner order subscription failed', { error: String(e) }),
+    );
   }
 
   private onRunners(v: unknown): void {
@@ -402,12 +444,14 @@ export class ThreadIndex {
       this.unwatch();
       this.watch();
     }
+    // The backend's taken the runner order since the watch began.
+    if (this.unsubscribe) this.watchOrder();
     for (const t of this.deps.host.list(['inbox', 'snoozed', 'archived'])) this.mark(t);
     this.schedule();
   }
 
   private mark(t: ThreadSummary): void {
-    const row = toIndexRow(t, this.deps.takesStartedBy?.() ?? true, this.deps.takesStars?.() ?? true, this.deps.takesAsked?.() ?? true);
+    const row = toIndexRow(t, this.deps.takesStartedBy?.() ?? true, this.deps.takesStars?.() ?? true, this.deps.takesAsked?.() ?? true, this.deps.takesRecap?.() ?? true);
     if (this.sent.get(t.id) === writeKey(row)) {
       this.dirty.delete(t.id);
       return;
@@ -482,8 +526,10 @@ export class ThreadIndex {
           online: now - r.lastSeenAt < ONLINE_MS,
           lastSeenAt: new Date(r.lastSeenAt).toISOString(),
           ...(r.rpcUrl ? { rpcUrl: r.rpcUrl } : {}),
+          ...(r.followProblem ? { followProblem: r.followProblem } : {}),
         })),
       threads: value?.threads ?? [],
+      ...(this.order ? { order: this.order } : {}),
     };
     this.deps.publish?.({ method: 'remoteThreads.updated', params: this.withTokens(this.remote) });
   }
@@ -491,6 +537,7 @@ export class ThreadIndex {
   // The token file is named only when it's there: no file, no way in.
   private withTokens(r: RemoteThreads): RemoteThreads {
     return {
+      ...r,
       threads: r.threads,
       runners: r.runners.map((x) => {
         const file = runnerTokenFile(this.deps.home, x.id);

@@ -46,6 +46,11 @@ const real = (p: string): string => {
 
 const inside = (p: string, dir: string): boolean => p === dir || p.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep);
 
+// Said when a thread shut in a sandbox (ThreadRecord.confined) would have
+// to run outside one: its folder isn't in one now, or isn't really there.
+export const CONFINED_NO_SANDBOX = (cwd: string) =>
+  `This thread runs in a sandbox, but ${cwd} isn't in a sandbox folder now, so it wasn't started. Move it back into one, or start a new thread there.`;
+
 // The sandbox a thread in `cwd` runs in, if its folder is under one of the
 // configured ones.
 export function sandboxFor(sb: SandboxConfig | undefined, cwd: string): SandboxConfig | undefined {
@@ -55,7 +60,11 @@ export function sandboxFor(sb: SandboxConfig | undefined, cwd: string): SandboxC
 }
 
 // Variables the container gets its own of, rather than the runner's.
-const OWN_ENV = new Set(['PATH', 'HOME', 'PWD', 'OLDPWD', 'SHLVL', '_', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL']);
+// THREADBEAR_NODE names the host's Node (threadEnv), which isn't in the
+// container: passed in, the repo's scripts would refuse it rather than use
+// the container's own node (Codex's review, 9 Nov 2026). Its old name too,
+// which the scripts turn back into it.
+const OWN_ENV = new Set(['PATH', 'HOME', 'PWD', 'OLDPWD', 'SHLVL', '_', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL', 'THREADBEAR_NODE', 'THREADBARE_NODE']);
 
 export type DockerRun = { command: string; args: string[]; name: string };
 
@@ -75,6 +84,10 @@ export function dockerRun(
     mounts.set(p, mode);
   };
   const cwd = ctx.realpath(spawn.cwd ?? ctx.home);
+  // Checked again where the folder is mounted from: a link put in its
+  // place since the thread was matched to the sandbox would mount
+  // wherever it points (Daybreak, 7 Nov 2026).
+  if (!sb.folders.some((f) => inside(cwd, ctx.realpath(f)))) throw new Error(CONFINED_NO_SANDBOX(spawn.cwd ?? ctx.home));
   mount(cwd, 'rw');
   // The login's config: sessions, credentials, checkpoints. ~/.claude.json
   // sits beside the default one.

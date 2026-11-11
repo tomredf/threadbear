@@ -109,7 +109,7 @@ struct ComposerControls: View {
             .frame(height: zoomed(26))
             .tip("\(place), in \(thread.cwd.abbreviatingHome)")
             Spacer(minLength: zoomed(8))
-            SendButton(running: running, canSend: canSend, sending: sending, onSend: onSend, onStop: { app.interrupt() })
+            SendButton(running: running, canSend: canSend, sending: sending, stopping: app.isBusy(BusyKey.stop(thread.id)), onSend: onSend, onStop: { app.interrupt(thread.id) })
                 .layoutPriority(1)
         }
         .frame(height: SendButton.size)
@@ -122,6 +122,9 @@ struct ComposerControls: View {
         // A new thread for another runner: no pictures or schedules from
         // here (paths on this Mac). Its folder is in the machine chip's menu.
         let draftAway = thread == nil && app.newThreadRunnerId != nil
+        // A login or pool pick can't be guessed (ThreadUpdate.applied), so
+        // the chips that show it spin until the runner has made it.
+        let moving = thread.map { app.isBusy(BusyKey.moving($0.id)) } ?? false
         HStack(spacing: zoomed(4)) {
             if let remote {
                 runnerChip(remote.thread, place: remote.place)
@@ -131,7 +134,7 @@ struct ComposerControls: View {
                 runsOnChip
                     .padding(.leading, -zoomed(7))
             } else {
-                PlusButton { settings.plusMenu(attach: onAttach, schedule: app.schedulesSupported ? onSchedule : nil) }
+                PlusButton(busy: thread.map { app.isBusy(BusyKey.movingFolder($0.id)) } ?? false) { settings.plusMenu(attach: onAttach, schedule: app.schedulesSupported ? onSchedule : nil) }
                     // Pulls the glyph back so it lines up with the text above.
                     .padding(.leading, -zoomed(7))
                 runsOnChip
@@ -140,12 +143,12 @@ struct ComposerControls: View {
             // chip: the model chip names the pool (or the pinned login).
             if !settings.usesPools {
                 ComposerChip(icon: "person.crop.circle", title: AccountName.short(account, accounts: settings.logins.accounts), help: settings.accountChipHelp,
-                             badge: settings.accountBadge, popover: {
+                             badge: settings.accountBadge, busy: moving, popover: {
                     NSHostingController(rootView: AccountPickerView(threadId: thread?.id, close: $0).environment(app))
                 }, openRequest: app.accountPickerRequest)
                 ChipDivider()
             }
-            ComposerChip(icon: settings.modelChipIcon, logo: settings.modelChipLogo, title: settings.modelChipTitle, help: settings.modelChipHelp, badge: settings.modelChipBadge, popover: {
+            ComposerChip(icon: settings.modelChipIcon, logo: settings.modelChipLogo, title: settings.modelChipTitle, help: settings.modelChipHelp, badge: settings.modelChipBadge, busy: moving, popover: {
                 // The picker reads the thread live, so a pick made while
                 // it's open shows straight away.
                 NSHostingController(rootView: ModelPickerView(threadId: thread?.id, close: $0).environment(app))
@@ -166,7 +169,7 @@ struct ComposerControls: View {
                     NSHostingController(rootView: ContextPopover(threadId: thread.id).environment(app))
                 }
             }
-            SendButton(running: running, canSend: canSend, sending: sending, onSend: onSend, onStop: { app.interrupt() })
+            SendButton(running: running, canSend: canSend, sending: sending, stopping: thread.map { app.isBusy(BusyKey.stop($0.id)) } ?? false, onSend: onSend, onStop: { app.interrupt(thread?.id) })
                 .layoutPriority(1)
                 // Right-click send for later, as Mail and Slack do. Not on
                 // another Mac's thread: its schedules are made from there.
@@ -639,9 +642,9 @@ struct ThreadSettings {
 
     func permissionMenu() -> NSMenu {
         let menu = NSMenu()
-        // Auto is Claude Code's; Codex has nothing like it, so it's only offered
-        // for Claude (or if a thread is somehow on it already).
-        let modes: [PermissionMode] = provider == "claude" || permissionMode == .auto ? [.full, .auto, .ask, .plan] : [.full, .ask, .plan]
+        // Auto needs a provider with its own judge of each action. Without one
+        // it's only there for a thread that is somehow on it already.
+        let modes: [PermissionMode] = Providers.info(provider).autoMode == "classifier" || permissionMode == .auto ? [.full, .auto, .ask, .plan] : [.full, .ask, .plan]
         for mode in modes {
             let item = ActionMenuItem(mode.composerTitle, symbol: mode.composerIcon, checked: permissionMode == mode) { setPermission(mode) }
             item.subtitle = mode.composerHelp
@@ -698,6 +701,7 @@ private extension PermissionMode {
         case .ask: "Ask before edits"
         case .auto: "Auto"
         case .plan: "Plan first"
+        case .unknown: "Unknown mode"
         }
     }
 
@@ -707,6 +711,7 @@ private extension PermissionMode {
         case .ask: "lock"
         case .auto: "lock.shield"
         case .plan: "list.bullet.clipboard"
+        case .unknown: "questionmark.circle"
         }
     }
 
@@ -716,6 +721,7 @@ private extension PermissionMode {
         case .ask: "Asks before editing files or running commands"
         case .auto: "A safety check approves or blocks each action, and asks only when unsure"
         case .plan: "Reads and plans, and changes nothing until you approve its plan"
+        case .unknown: "A mode from a newer runner that this app doesn't know. Update the app to see it. Anything made from this thread here asks before edits"
         }
     }
 }
@@ -733,6 +739,9 @@ private struct ComposerChip: View {
     /// After the title: "· 12%" in orange, "Limit reached" in red. Colour
     /// only here, where it means the account is running out.
     var badge: AccountUsageText.ChipBadge? = nil
+    /// A pick from this chip is on its way: a spinner for the icon, and it
+    /// won't open again until that's landed.
+    var busy = false
     var menu: (() -> NSMenu)? = nil
     /// Instead of a menu: a popover above the chip, given a way to close
     /// itself.
@@ -749,7 +758,10 @@ private struct ComposerChip: View {
         } label: {
             HStack(spacing: zoomed(4)) {
                 Group {
-                    if let logo {
+                    if busy {
+                        SpinnerMark(color: .secondaryLabelColor)
+                            .frame(width: TypeScale.chip, height: TypeScale.chip)
+                    } else if let logo {
                         ProviderMark(provider: logo, symbol: icon, side: TypeScale.chip - 1)
                     } else {
                         Image(systemName: icon)
@@ -798,10 +810,12 @@ private struct ComposerChip: View {
         .background(MenuAnchorView(anchor: anchor))
         .onHover { hovering = $0 }
         .onChange(of: openRequest) { _, _ in open() }
-        .tip(help)
+        .disabled(busy)
+        .tip(busy ? "Moving this thread" : help)
     }
 
     private func open() {
+        guard !busy else { return }
         if let menu { anchor.popUp(menu()) }
         else if let popover { anchor.show(popover) }
     }
@@ -848,6 +862,9 @@ private struct ContextRing: View {
 /// The ring's popover: the context in tokens, what happens when it fills,
 /// then the model and login the thread is really running on and what it
 /// has cost. Reads the thread live, so it moves while a turn runs.
+/// On a Claude thread it also shows what fills the context, in Claude's
+/// own words (ContextBreakdown, after Ghostex's panel): asked when it
+/// opens and from its refresh button, never on a timer.
 struct ContextPopover: View {
     @Environment(AppModel.self) private var app
     let threadId: String
@@ -856,16 +873,27 @@ struct ContextPopover: View {
         let thread = app.threads[threadId]
         VStack(alignment: .leading, spacing: 6) {
             if let thread, let meter = ContextMeter(thread) {
-                Text("Context").font(.system(size: 13, weight: .semibold))
-                ProgressView(value: meter.fraction)
-                    .progressViewStyle(.linear)
-                    .tint(meter.isNearlyFull ? .orange : .secondary)
+                let claude = thread.provider == "claude"
+                let answer = app.contextUsage[threadId]
+                let breakdown = claude ? ContextBreakdown(answer?.usage) : nil
                 HStack {
-                    Text(meter.amount)
+                    Text("Context").font(.system(size: 13, weight: .semibold))
                     Spacer()
-                    Text("\(meter.percent)%").foregroundStyle(.secondary)
+                    if claude { refreshButton(answer) }
                 }
-                .font(.system(size: 12))
+                if let breakdown {
+                    BreakdownView(breakdown: breakdown, note: answer?.note)
+                } else {
+                    ProgressView(value: meter.fraction)
+                        .progressViewStyle(.linear)
+                        .tint(meter.isNearlyFull ? .orange : .secondary)
+                    HStack {
+                        Text(meter.amount)
+                        Spacer()
+                        Text("\(meter.percent)%").foregroundStyle(.secondary)
+                    }
+                    .font(.system(size: 12))
+                }
                 Text(ContextMeter.compactNote(provider: thread.provider))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
@@ -878,7 +906,31 @@ struct ContextPopover: View {
             }
         }
         .padding(14)
-        .frame(width: 260)
+        // Room for a breakdown row's name, tokens and share on a Claude
+        // thread; a Codex thread's popover is as it was.
+        .frame(width: app.threads[threadId]?.provider == "claude" ? 290 : 260)
+        .onAppear { app.loadContextUsage(threadId) }
+    }
+
+    /// Asks Claude again. Spins while it asks; off once the runner has said
+    /// the thread has no CLI running to ask (it answers the kept one then).
+    private func refreshButton(_ answer: ContextUsageAnswer?) -> some View {
+        let loading = app.contextUsageLoading.contains(threadId)
+        let asleep = answer.map { !$0.live } ?? false
+        return Button {
+            app.loadContextUsage(threadId)
+        } label: {
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: 11, weight: .medium))
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .disabled(asleep)
+        .opacity(asleep ? 0.4 : 1)
+        .busy(loading)
+        .tip(asleep ? "Claude isn't running for this thread now. It can say again after your next message." : "Ask Claude again what fills the context")
     }
 
     private func row(_ name: String, _ value: String) -> some View {
@@ -888,6 +940,129 @@ struct ContextPopover: View {
             Text(value).lineLimit(1).truncationMode(.middle)
         }
         .font(.system(size: 12))
+    }
+}
+
+extension AppModel {
+    /// Asks for a Claude thread's context breakdown: when the ring's
+    /// popover opens and from its refresh button, never on a timer. The
+    /// last answer stays meanwhile, so the popover opens on it.
+    func loadContextUsage(_ threadId: String) {
+        guard !contextUsageLoading.contains(threadId), threads[threadId]?.provider == "claude", let client = client(for: threadId) else { return }
+        contextUsageLoading.insert(threadId)
+        Task { [weak self] in
+            do {
+                let answer = try await client.contextUsage(threadId: threadId)
+                self?.contextUsage[threadId] = answer
+            } catch {
+                // An older runner (-32601), or another Mac's thread through
+                // the backend: the popover keeps to the totals. A breakdown
+                // kept from before (the thread was on this Mac's runner
+                // until it moved) goes, as nobody can bring it up to date.
+                self?.contextUsage[threadId] = nil
+                AppLog.write("rpc", "threads.contextUsage failed: \(error.localizedDescription)")
+            }
+            self?.contextUsageLoading.remove(threadId)
+        }
+    }
+}
+
+/// "32% used  323k / 1M", the stacked bar, a row each, and how old it is.
+private struct BreakdownView: View {
+    let breakdown: ContextBreakdown
+    let note: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(breakdown.headline).font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(breakdown.amount).font(.system(size: 12)).foregroundStyle(.secondary).monospacedDigit()
+            }
+            bar.padding(.bottom, 2)
+            ForEach(breakdown.rows) { row in
+                HStack(spacing: 7) {
+                    Swatch(swatch: row.swatch, hollow: row.deferred)
+                    Text(row.name)
+                        .foregroundStyle(row.deferred || row.swatch == .buffer || row.swatch == .free ? .secondary : .primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(row.tokenText).foregroundStyle(.secondary).monospacedDigit()
+                    Text(row.percentText ?? "")
+                        .foregroundStyle(.secondary).monospacedDigit()
+                        .frame(width: 38, alignment: .trailing)
+                }
+                .font(.system(size: 12))
+                .tip(row.deferred ? "Tool definitions Claude loads only when it needs one, so they aren't in the context yet." : "")
+            }
+            if let at = breakdown.at {
+                // Ticks over by itself while the popover stays open.
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    HStack(spacing: 4) {
+                        Text("Breakdown from \(ContextBreakdown.age(at, now: context.date))")
+                        if let note {
+                            Image(systemName: "exclamationmark.circle").tip(note)
+                        }
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    /// What's used from the left, the buffer Claude keeps for compacting
+    /// at the right, the free space between.
+    private var bar: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let size = { (row: ContextBreakdown.Row) -> CGFloat in
+                // A sliver for a small row, so it still shows; never wider
+                // than the bar, whatever count a runner sent.
+                max(1.5, width * CGFloat(min(1, max(0, row.fraction ?? 0))))
+            }
+            ZStack(alignment: .leading) {
+                Rectangle().fill(Swatch.color(.free))
+                HStack(spacing: 0) {
+                    ForEach(breakdown.bar.filter { $0.swatch != .buffer }) { Rectangle().fill(Swatch.color($0.swatch)).frame(width: size($0)) }
+                }
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    ForEach(breakdown.bar.filter { $0.swatch == .buffer }) { Rectangle().fill(Swatch.color($0.swatch)).frame(width: size($0)) }
+                }
+            }
+            .clipShape(Capsule())
+        }
+        .frame(height: 6)
+    }
+}
+
+/// A row's colour square: muted, so the bar reads at a glance without the
+/// popover turning into a rainbow.
+private struct Swatch: View {
+    let swatch: ContextBreakdown.Swatch
+    var hollow = false
+
+    static func color(_ swatch: ContextBreakdown.Swatch) -> Color {
+        switch swatch {
+        case .messages: Color(red: 0.42, green: 0.58, blue: 0.95)
+        case .memory: Color(red: 0.40, green: 0.75, blue: 0.58)
+        case .skills: Color(red: 0.68, green: 0.55, blue: 0.92)
+        case .agents: Color(red: 0.35, green: 0.72, blue: 0.80)
+        case .mcp: Color(red: 0.86, green: 0.68, blue: 0.32)
+        case .system: Color.primary.opacity(0.42)
+        case .other: Color.primary.opacity(0.30)
+        case .buffer: Color.primary.opacity(0.22)
+        case .free: Color.primary.opacity(0.10)
+        }
+    }
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 2)
+            .fill(hollow ? Color.clear : Self.color(swatch))
+            .overlay(RoundedRectangle(cornerRadius: 2).strokeBorder(hollow ? Color.secondary : .clear, lineWidth: 1))
+            .frame(width: 9, height: 9)
     }
 }
 
@@ -901,6 +1076,8 @@ private struct ChipDivider: View {
 
 /// Opens a small menu: "Attach images…" and the folder.
 private struct PlusButton: View {
+    /// A folder picked from its menu is on its way.
+    var busy = false
     let menu: () -> NSMenu
     @State private var hovering = false
     @State private var anchor = MenuAnchor()
@@ -917,6 +1094,7 @@ private struct PlusButton: View {
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .busy(busy)
         .background(MenuAnchorView(anchor: anchor))
         .onHover { hovering = $0 }
         .tip("Attach images, change the folder or schedule the message")
@@ -930,8 +1108,11 @@ private struct SendButton: View {
     let running: Bool
     let canSend: Bool
     let sending: Bool
+    /// The Stop is on its way: a spinner until the turn has ended.
+    var stopping = false
     let onSend: () -> Void
     let onStop: () -> Void
+    @Environment(\.sendNudges) private var nudges
 
     static var size: CGFloat { zoomed(28) }
 
@@ -949,6 +1130,13 @@ private struct SendButton: View {
                 .background(Circle().fill(Color.primary.opacity(0.1)))
                 .tip("Starting the thread")
                 .accessibilityLabel("Starting the thread")
+        } else if running && !canSend && stopping {
+            SpinnerMark(color: .secondaryLabelColor)
+                .padding(zoomed(6))
+                .frame(width: Self.size, height: Self.size)
+                .background(Circle().fill(Color.primary.opacity(0.1)))
+                .tip("Stopping")
+                .accessibilityLabel("Stopping")
         } else if running && !canSend {
             Button(action: onStop) {
                 Image(systemName: "stop.fill").font(.system(size: zoomed(9), weight: .bold))
@@ -961,6 +1149,14 @@ private struct SendButton: View {
         } else {
             Button(action: onSend) {
                 Image(systemName: "arrow.up").font(.system(size: zoomed(13), weight: .semibold))
+                    // Up 3 pt and back as Return lands: the first half of
+                    // the message leaving (`SendLift`).
+                    .keyframeAnimator(initialValue: CGFloat(0), trigger: Juice.reduceMotion ? 0 : nudges) { arrow, y in
+                        arrow.offset(y: y)
+                    } keyframes: { _ in
+                        CubicKeyframe(-zoomed(3), duration: 0.05)
+                        CubicKeyframe(0, duration: 0.07)
+                    }
             }
             .buttonStyle(CircleButtonStyle(filled: canSend))
             .disabled(!canSend)
@@ -1093,7 +1289,9 @@ struct ModelPickerView: View {
                 .frame(maxHeight: Self.listMaxHeight(pools: pools))
                 .fixedSize(horizontal: false, vertical: true)
                 Divider()
-                EffortRow(levels: settings.effortLevels, chosen: settings.effectiveEffort) { settings.setEffort($0) }
+                if !settings.effortLevels.isEmpty {
+                    EffortRow(levels: settings.effortLevels, chosen: settings.effectiveEffort) { settings.setEffort($0) }
+                }
                 if pools, settings.pinnedLine != nil {
                     Divider()
                     PoolFooter(settings: settings, column: column, showPinned: { columnId = ThreadSettings.pinnedColumn },

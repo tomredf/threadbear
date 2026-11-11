@@ -69,11 +69,13 @@ extension AppModel {
     func newThreadRequest(text: String, images: [ImageRef]) -> NewThreadRequest {
         // This Mac's logins, or the chosen runner's for a draft on it.
         let logins = draftLogins
-        let ask = newThreadPermission
+        // `.unknown` is the runner's own default, a mode this app doesn't
+        // know: left out, the runner starts the thread on exactly that.
+        let ask: PermissionMode? = newThreadPermission == .unknown ? nil : newThreadPermission
         // Another runner that hasn't said hello yet: its own defaults,
         // in the folder typed for it if any (the runner checks it).
         if newThreadRunnerId != nil, newThreadLogins == nil {
-            return NewThreadRequest(text: text, images: [], cwd: newThreadCwd, permissionMode: ask)
+            return NewThreadRequest(text: text, images: images, cwd: newThreadCwd, permissionMode: ask)
         }
         let cwd = newThreadCwd ?? logins.defaults.cwd
         if let poolId = newThreadPoolId, let pool = logins.pool(poolId) {
@@ -126,7 +128,10 @@ extension AppModel {
         guard let login = Pools.pickLogin(pool, accounts: logins.accounts, provider: provider, current: lastAccountId(provider: provider)) else { return }
         var change = ThreadUpdate(accountId: login, model: .some(model))
         if let effort = lastEfforts[provider] { change.effort = .some(effort) }
+        let moving = BusyKey.moving(threadId)
+        beginBusy(moving)
         Task {
+            defer { endBusy(moving) }
             do {
                 _ = try await client.updateThread(threadId, change)
                 threads[threadId] = try await client.updateThread(threadId, ThreadUpdate(poolId: .some(poolId)))

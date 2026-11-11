@@ -25,7 +25,10 @@ struct ScheduleEditorState: Identifiable, Equatable {
     var poolId: String?
     var model: String?
     var effort: String?
-    var ask = false
+    /// The composer's mode as it was, Auto too: the editor has no control
+    /// for it, so turning Auto into Ask left a schedule's threads waiting
+    /// on every edit with nobody there to see why.
+    var permissionMode: PermissionMode = .full
     /// Another runner it runs on (`runners.list`); nil is this one. Only
     /// for a new thread each time. There the folder is a path on that
     /// runner's Mac, typed as is ("" for its default folder), and the
@@ -74,6 +77,35 @@ extension AppModel {
                 runners = try await client.listRunners()
             } catch {
                 AppLog.write("rpc", "runners.list failed: \(error.localizedDescription)")
+                retryRunners(on: client)
+            }
+        }
+    }
+
+    /// runners.list asks the backend, so it fails with no network, even
+    /// though this Mac's own rows need only its name from the answer. On a
+    /// timer rather than on news of other runners: with them all offline
+    /// there may be no news when the network comes back. One timer at a
+    /// time, until the name is known or this connection has gone (the next
+    /// one asks for itself).
+    private func retryRunners(on client: RPCClient) {
+        guard runnersRetry == nil, !runners.contains(where: \.isSelf) else { return }
+        runnersRetry = Task { [self] in
+            try? await Task.sleep(for: runnersRetryDelay)
+            runnersRetry = nil
+            if self.client === client, !runners.contains(where: \.isSelf) { loadRunners() }
+        }
+    }
+
+    /// The Runners panel's refresh button: its icon spins, and it says if
+    /// the runners couldn't be read.
+    func refreshRunners() {
+        guard let client else { return }
+        whileBusy(BusyKey.refreshRunners) { [self] in
+            do {
+                runners = try await client.listRunners()
+            } catch {
+                show(error)
             }
         }
     }
@@ -171,8 +203,7 @@ extension AppModel {
         state.poolId = settings.pool?.id
         state.model = settings.model
         state.effort = settings.effort
-        // The editor only offers Ask or Full; Auto carries over as the safer one.
-        state.ask = settings.permissionMode != .full
+        state.permissionMode = settings.permissionMode
         scheduleEditor = state
         loadRunners()
     }
@@ -193,6 +224,12 @@ extension AppModel {
         } else {
             state.cwd = schedule.cwd ?? defaults.cwd
         }
+        // Shown so they can be changed; only the model and effort are sent
+        // back (ScheduleEditor's model rows), so the login stays as it was.
+        state.accountId = schedule.accountId
+        state.poolId = schedule.poolId
+        state.model = schedule.model
+        state.effort = schedule.effort
         scheduleEditor = state
         loadRunners()
     }
@@ -206,9 +243,14 @@ extension AppModel {
         do {
             let saved: Schedule
             if let id = state.scheduleId {
+                // A new thread each time on this Mac: its model and effort
+                // too (nil goes back to the default). Another Mac's logins
+                // aren't this one's, and a thread's schedule uses the thread's.
+                let ownModel = state.threadId == nil && !state.isAway
                 saved = try await client.updateSchedule(id, ScheduleUpdate(
                     title: title.isEmpty ? nil : title, text: text, when: state.when,
-                    cwd: state.threadId == nil ? state.cwd.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+                    cwd: state.threadId == nil ? state.cwd.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
+                    model: ownModel ? .some(state.model) : .none, effort: ownModel ? .some(state.effort) : .none
                 ))
             } else if state.isAway && state.threadId == nil {
                 // Its folder is sent as typed and checked on that Mac when
@@ -217,13 +259,13 @@ extension AppModel {
                 let cwd = state.cwd.trimmingCharacters(in: .whitespacesAndNewlines)
                 saved = try await client.createSchedule(NewScheduleRequest(
                     text: text, title: title.isEmpty ? nil : title, when: state.when,
-                    cwd: cwd.isEmpty ? nil : cwd, permissionMode: state.ask ? .ask : .full, runnerId: state.runnerId
+                    cwd: cwd.isEmpty ? nil : cwd, permissionMode: state.permissionMode, runnerId: state.runnerId
                 ))
             } else {
                 saved = try await client.createSchedule(NewScheduleRequest(
                     text: text, title: title.isEmpty ? nil : title, when: state.when, threadId: state.threadId,
                     cwd: state.cwd, accountId: state.accountId, poolId: state.poolId, model: state.model, effort: state.effort,
-                    permissionMode: state.ask ? .ask : .full
+                    permissionMode: state.permissionMode
                 ))
             }
             replace(saved)
@@ -261,10 +303,11 @@ extension AppModel {
     // MARK: Row actions
 
     /// Another runner's schedule comes back queued, with `runRequestedAt`
-    /// set, which its row shows until that runner has run it.
+    /// set, which its row shows until that runner has run it. The row spins
+    /// until the reply.
     func runSchedule(_ id: String) {
         guard let client else { return }
-        Task {
+        whileBusy(BusyKey.runSchedule(id)) { [self] in
             do {
                 replace(try await client.runSchedule(id).schedule)
             } catch {
@@ -273,12 +316,21 @@ extension AppModel {
         }
     }
 
+    /// Shows at once, and goes back if the runner refuses. The control waits
+    /// for one to land before taking another, so two can't overlap: if both
+    /// failed, the second's rollback would leave the first's guess showing.
     func setSchedulePaused(_ id: String, _ paused: Bool) {
-        guard let client else { return }
-        Task {
+        let key = BusyKey.pauseSchedule(id)
+        guard let client, !isBusy(key) else { return }
+        let before = schedule(id)
+        var guess = before
+        guess?.paused = paused
+        if let guess { replace(guess) }
+        whileBusy(key) { [self] in
             do {
                 replace(try await client.updateSchedule(id, ScheduleUpdate(paused: paused)))
             } catch {
+                if let before, schedule(id) == guess { replace(before) }
                 show(error)
             }
         }
@@ -294,12 +346,23 @@ extension AppModel {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         if scheduleEditor?.scheduleId == id { scheduleEditor = nil }
+        confirmedDeleteSchedule(id, client: client)
+    }
+
+    /// Gone at once, and back where it was if the runner refuses.
+    func confirmedDeleteSchedule(_ id: String, client: RPCClient) {
+        guard let schedule = schedule(id) else { return }
+        let index = schedules.firstIndex { $0.id == id } ?? 0
+        schedules.removeAll { $0.id == id }
         Task {
             do {
                 try await client.deleteSchedule(id)
                 schedules.removeAll { $0.id == id }
             } catch {
+                if self.schedule(id) == nil { schedules.insert(schedule, at: min(index, schedules.count)) }
                 show(error)
+                // It may have gone through and only the reply been lost.
+                loadSchedules()
             }
         }
     }

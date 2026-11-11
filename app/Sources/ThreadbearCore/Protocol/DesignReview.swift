@@ -134,7 +134,9 @@ public struct ReviewOption: Sendable, Hashable, Codable, Identifiable {
         reference = (try? c.decodeIfPresent(Bool.self, forKey: .reference)) ?? false
         image = try c.decode(ImageRef.self, forKey: .image)
         shots = c.lossyArray(ReviewShot.self, forKey: .shots)
-        url = (try? c.decodeIfPresent(String.self, forKey: .url)) ?? nil
+        // Only a web page: a runner (maybe another Mac's) sends this, and
+        // Open live hands it to the system. Anything else is no url at all.
+        url = LinkPolicy.web((try? c.decodeIfPresent(String.self, forKey: .url)) ?? nil)?.absoluteString
     }
 
     enum CodingKeys: String, CodingKey { case id, title, note, reference, image, shots, url }
@@ -147,6 +149,8 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
     public var id: String
     public var title: String
     public var note: String?
+    /// The option id the agent would pick, marked with a star and "Recommended" as on an asks card.
+    public var recommended: String?
     public var options: [ReviewOption]
     public var status: String
     public var revision: Int
@@ -156,12 +160,13 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
     public var response: ReviewDraft?
     public var replyTurnId: String?
 
-    public init(id: String, title: String, note: String? = nil, options: [ReviewOption], status: String = "pending",
+    public init(id: String, title: String, note: String? = nil, recommended: String? = nil, options: [ReviewOption], status: String = "pending",
                 revision: Int = 1, createdAt: String = "", updatedAt: String = "", draft: ReviewDraft = ReviewDraft(),
                 response: ReviewDraft? = nil, replyTurnId: String? = nil) {
         self.id = id
         self.title = title
         self.note = note
+        self.recommended = recommended
         self.options = options
         self.status = status
         self.revision = revision
@@ -179,6 +184,7 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
         id = try c.decode(String.self, forKey: .id)
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? "Design options"
         note = try c.decodeIfPresent(String.self, forKey: .note)
+        recommended = (try? c.decodeIfPresent(String.self, forKey: .recommended)) ?? nil
         options = c.lossyArray(ReviewOption.self, forKey: .options)
         status = try c.decodeIfPresent(String.self, forKey: .status) ?? "unknown"
         revision = c.lenientInt(forKey: .revision) ?? 0
@@ -189,7 +195,7 @@ public struct DesignReview: Sendable, Hashable, Codable, Identifiable {
         replyTurnId = try c.decodeIfPresent(String.self, forKey: .replyTurnId)
     }
 
-    enum CodingKeys: String, CodingKey { case id, title, note, options, status, revision, createdAt, updatedAt, draft, response, replyTurnId }
+    enum CodingKeys: String, CodingKey { case id, title, note, recommended, options, status, revision, createdAt, updatedAt, draft, response, replyTurnId }
 }
 
 /// Creation takes source paths; the runner replaces these with imported
@@ -246,7 +252,7 @@ public struct ReviewAnswer: Sendable, Hashable {
     /// draft, so the bubble shows it as it is.
     public static func parse(_ text: String, reviewId: String?, response: ReviewDraft?) -> ReviewAnswer? {
         guard let reviewId, let response else { return nil }
-        var rest = Substring(text)
+        var rest = Self.withoutPassedOver(text)
         // "Review: <title> (<id>)"
         let head = " (\(reviewId))"
         guard rest.hasPrefix("Review: "), let close = rest.range(of: head) else { return nil }
@@ -291,6 +297,16 @@ public struct ReviewAnswer: Sendable, Hashable {
             notes[id] = nil
         }
         return rest.isEmpty && !lines.isEmpty ? ReviewAnswer(lines: lines) : nil
+    }
+
+    /// The runner's last paragraph names the options he passed over, for the
+    /// agent writing follow-ups (`PASSED_OVER_TAIL` in runner/src/reviews.ts);
+    /// his bubble leaves it out.
+    static let passedOverTail = "Don't offer one of these later (a next step, a follow-up) as if it were new: say it's one they passed over."
+
+    static func withoutPassedOver(_ text: String) -> Substring {
+        guard text.hasSuffix(passedOverTail), let start = text.range(of: "\n\nPassed over: ", options: .backwards) else { return Substring(text) }
+        return text[..<start.lowerBound]
     }
 
     /// Agents often title options "A: Summary first", which would read

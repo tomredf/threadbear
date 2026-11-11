@@ -55,7 +55,6 @@ struct DetailView: View {
             VStack(spacing: 0) {
             ConnectionBanner()
             ErrorBanner()
-            if let thread { LimitBanner(thread: thread) }
             if let thread { SignInBanner(thread: thread) }
             if let thread, thread.hasPendingReviews, subagentRef == nil {
                 PendingReviewsButton(thread: thread)
@@ -112,6 +111,7 @@ struct DetailView: View {
         .overlay(alignment: .top) {
             ArchivedToast()
             InboxEndToast()
+            MilestoneToast()
         }
     }
 }
@@ -237,6 +237,81 @@ private struct InboxEndToast: View {
     }
 }
 
+/// Floats where `ArchivedToast` does, once, when the thread count passes a
+/// milestone (`ThreadMilestones`), with the little bear waving. A click takes
+/// it down; otherwise it goes after a few seconds, once he's seen to be there.
+private struct MilestoneToast: View {
+    @Environment(AppModel.self) private var app
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var hovering = false
+    @State private var waves = 0
+
+    static let shownFor: Duration = .seconds(5)
+
+    var body: some View {
+        ZStack {
+            if let note = app.milestoneNote {
+                toast(note)
+                    .id(note.id)
+                    .transition(Juice.reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                    .onAppear { if !Juice.reduceMotion { waves += 1 } }
+                    .task(id: note.id) {
+                        try? await Task.sleep(for: Self.shownFor)
+                        // It's rare, and he may have stepped away just as it
+                        // came: it stays until he's back.
+                        while hovering || MilestoneWatch.secondsIdle() > 5, !Task.isCancelled {
+                            try? await Task.sleep(for: .milliseconds(300))
+                        }
+                        guard !Task.isCancelled else { return }
+                        app.dismissMilestoneNote(note.id)
+                    }
+            }
+        }
+        .animation(Juice.reduceMotion ? .easeOut(duration: 0.15) : .snappy(duration: 0.3), value: app.milestoneNote?.id)
+    }
+
+    private func toast(_ note: MilestoneNote) -> some View {
+        let dark = colorScheme == .dark
+        let shape = Capsule(style: .continuous)
+        return Button { app.dismissMilestoneNote(note.id) } label: {
+            HStack(spacing: zoomed(7)) {
+                Image(nsImage: Bear.image(.wave, side: zoomed(17)))
+                    .renderingMode(.template)
+                    // InboxZero's wave: a beat, then tilts from its feet.
+                    .keyframeAnimator(initialValue: 0.0, trigger: waves) { bear, angle in
+                        bear.rotationEffect(.degrees(angle), anchor: .bottom)
+                    } keyframes: { _ in
+                        KeyframeTrack {
+                            CubicKeyframe(0, duration: 0.25)
+                            CubicKeyframe(-9, duration: 0.14)
+                            CubicKeyframe(7, duration: 0.16)
+                            CubicKeyframe(-5, duration: 0.14)
+                            CubicKeyframe(0, duration: 0.2)
+                        }
+                    }
+                    .accessibilityHidden(true)
+                Text(ThreadMilestones.title(note.tier))
+                Text(ThreadMilestones.line(note.tier)).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .tip("Dismiss")
+        .font(.system(size: TypeScale.label))
+        .padding(.leading, zoomed(11))
+        .padding(.trailing, zoomed(14))
+        .padding(.vertical, zoomed(7))
+        .background {
+            shape
+                .fill(.regularMaterial)
+                .shadow(color: .black.opacity(dark ? 0.4 : 0.12), radius: zoomed(10), y: zoomed(3))
+        }
+        .overlay(shape.strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+        .onHover { hovering = $0 }
+        .padding(.top, zoomed(10))
+    }
+}
+
 /// The thread panel's title line, in its bar: the thread's, the project's,
 /// or nothing over the Projects page (the selected thread isn't what's
 /// showing there).
@@ -275,6 +350,7 @@ struct ThreadMenuButton: View {
                 ThreadMenu(thread: thread)
                 Divider()
                 Button("Copy transcript as Markdown", systemImage: "doc.plaintext") { session?.copyTranscript() }
+                    .disabled(app.isBusy(BusyKey.copying(thread.id)))
                 // So Mike can point an agent at this thread (`tb show <id>`).
                 Button("Copy thread id", systemImage: "number") { app.copyToPasteboard(thread.id) }
                 // Only while there's a website to go to, as with the share
@@ -282,7 +358,7 @@ struct ThreadMenuButton: View {
                 // the share button sits right beside this menu, and the web
                 // page has its own Copy link and share controls.
                 if let link = app.threadWebLink(thread.id) {
-                    Button("Open on the web", systemImage: "safari") { NSWorkspace.shared.open(link) }
+                    Button("Open on the web", systemImage: "safari") { OpenGate.openWeb(link) }
                 }
             }
         } label: {
@@ -590,13 +666,55 @@ struct ComposerPlacement: Layout {
 }
 
 private struct NewThreadHeading: View {
+    @Environment(AppModel.self) private var app
+
     var body: some View {
+        let typing = !(app.drafts["new"]?.text.isEmpty ?? true)
         Text("What should we work on?")
             .font(.system(size: zoomed(24), weight: .semibold))
             .foregroundStyle(.primary)
             .multilineTextAlignment(.center)
             .padding(.horizontal, zoomed(24))
             .frame(maxWidth: .infinity)
+            // Over the heading rather than in the layout, so nothing moves
+            // to make room for it.
+            .overlay(alignment: .top) {
+                if app.inboxZeroBear == .shown, !InboxZero.isBedtime(BearGeometry.date()) {
+                    PaneBear()
+                        .offset(y: -(PaneBear.side + zoomed(12)))
+                        .transition(.opacity)
+                }
+            }
+            .onChange(of: typing) { _, typing in
+                if typing { withAnimation(.easeOut(duration: 0.15)) { app.inboxZeroBear = nil } }
+            }
+            .onDisappear { app.inboxZeroBear = nil }
+    }
+}
+
+/// "In builder-skills": the project a thread started from its page joins
+/// as it's made, with an x to start it outside the project instead.
+private struct NewThreadProjectChip: View {
+    @Environment(AppModel.self) private var app
+    let project: Project
+
+    var body: some View {
+        HStack(spacing: zoomed(6)) {
+            ProjectIconView(project: project, size: 16)
+            Text("In \(project.title)")
+                .font(.system(size: TypeScale.label, weight: .medium))
+            Button { app.newThreadProjectId = nil } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: zoomed(9), weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .tip("Start it outside the project")
+        }
+        .padding(.horizontal, zoomed(10))
+        .padding(.vertical, zoomed(5))
+        .background(Capsule().fill(Color.primary.opacity(0.06)))
+        .tip("The thread joins \(project.title) as it starts, so the agent has its goals from the first message")
     }
 }
 
@@ -620,6 +738,9 @@ private struct NewThreadNote: View {
             ?? (app.newThreadUsesPools ? AccountName.login(account, accounts: logins.accounts) : AccountName.short(account, accounts: logins.accounts))
         let title = logins.account(account).map(AccountName.title) ?? account
         VStack(spacing: zoomed(14)) {
+            if let projectId = app.newThreadProjectId, let project = app.projects.first(where: { $0.id == projectId }) {
+                NewThreadProjectChip(project: project)
+            }
             if let runner, app.newThreadLogins == nil {
                 // Its logins and folders come with its hello.
                 Text("Starts on \(runner.name)")
@@ -658,6 +779,38 @@ private struct NewThreadNote: View {
         .frame(maxWidth: .infinity)
     }
 }
+
+#if DEBUG
+/// What the new-thread page shows, as `dump` reads it: the same words as
+/// NewThreadNote and its room cards, or nil with something else in the pane.
+@MainActor
+func newThreadPageDump(_ app: AppModel) -> AppDump.NewThreadInfo? {
+    guard app.selection == nil, app.openProject == nil, !app.showsHomePage else { return nil }
+    let logins = app.draftLogins
+    let runner = app.newThreadRunner
+    let cwd = app.newThreadCwd ?? logins.defaults.cwd
+    let account = app.newThreadAccountId
+    let pool = app.newThreadPoolId.flatMap(logins.pool)
+    let on = pool.map { "the \($0.title) pool" }
+        ?? (app.newThreadUsesPools ? AccountName.login(account, accounts: logins.accounts) : AccountName.short(account, accounts: logins.accounts))
+    let note: String
+    if let runner, app.newThreadLogins == nil {
+        note = "Starts on \(runner.name)"
+    } else if let runner {
+        note = "Starts in \(FolderName.short(cwd)) on \(runner.name), with \(on)"
+    } else {
+        note = "Starts in \(FolderName.short(cwd)) on \(on)"
+    }
+    let accounts = UsageGroups.byProvider(logins.accounts).flatMap(\.accounts)
+        .filter { item in pool.map { $0.accountIds.contains(item.id) } ?? true }
+    let rooms: [AppDump.RoomInfo] = accounts.count > 1 && accounts.contains(where: { $0.usage != nil }) ? accounts.map { item in
+        AppDump.RoomInfo(label: AccountName.label(item.id, accounts: logins.accounts), line: AccountUsageText.roomLine(item.usage) ?? "Nothing known yet",
+                         selected: pool == nil && item.id == account, note: item.note)
+    } : []
+    let project = app.newThreadProjectId.flatMap { id in app.projects.first { $0.id == id } }.map { "In \($0.title)" }
+    return AppDump.NewThreadInfo(heading: "What should we work on?", note: note, project: project, rooms: rooms)
+}
+#endif
 
 /// One account on the new-thread page: its name (the domain when two
 /// share the part before the @), a bar of the
@@ -771,6 +924,7 @@ struct ConnectionBanner: View {
             Spacer()
             if banner.showStart {
                 Button("Start runner") { app.startRunner() }
+                    .busy(app.isBusy(BusyKey.startRunner))
                     .tip("Start the runner's background service")
             }
             if banner.showRetry {
@@ -784,48 +938,9 @@ struct ConnectionBanner: View {
     }
 }
 
-/// The open thread's account is at its limit (or its last turn failed on
-/// it): says so, with a button to move the thread to the account with the
-/// most room. Here rather than in the transcript's error row, whose drawing
-/// is cached and knows nothing of accounts, so the name and the room it
-/// offers stay current as usage changes.
-struct LimitBanner: View {
-    @Environment(AppModel.self) private var app
-    let thread: ThreadSummary
-
-    var body: some View {
-        if let advice = app.limitAdvice(for: thread) {
-            // A pool thread waiting for room carries on by itself: a quiet
-            // clock rather than the red limit gauge, and the button pins it
-            // to a login outside the pool, so it says so.
-            let waiting = thread.waitingForRoom != nil && app.usesPools
-            HStack(spacing: zoomed(8)) {
-                if waiting {
-                    Image(systemName: "clock").foregroundStyle(.secondary)
-                } else {
-                    Image(systemName: "gauge.with.dots.needle.100percent").foregroundStyle(.red)
-                }
-                Text(advice.text).lineLimit(1).tip(advice.text)
-                Spacer(minLength: zoomed(6))
-                if let target = advice.target {
-                    let title = AccountUsageText.switchTitle(target, accounts: app.accounts)
-                    Button(waiting ? title.replacingOccurrences(of: "Switch to", with: "Pin to") : title) {
-                        app.switchAccount(thread.id, to: target.id)
-                    }
-                    .tip("Carry on this thread on that account, from where it is")
-                }
-            }
-            .font(.system(size: TypeScale.label))
-            .padding(.horizontal, zoomed(14))
-            .padding(.vertical, zoomed(7))
-            .overlay(alignment: .bottom) { Rectangle().fill(Color(nsColor: Theme.hairline)).frame(height: 0.5) }
-        }
-    }
-}
-
 /// The open thread's last turn failed because its login was refused:
 /// says so, with Sign in… (Terminal, on the CLI's own sign-in) and Send
-/// again for once that's done. Like LimitBanner, here rather than in the
+/// again for once that's done. Like LimitBox, here rather than in the
 /// cached error row, which knows nothing of accounts.
 struct SignInBanner: View {
     @Environment(AppModel.self) private var app
@@ -833,7 +948,7 @@ struct SignInBanner: View {
 
     var body: some View {
         if let account = app.signInAccount(for: thread) {
-            let name = account.provider == "codex" ? "Codex" : "Claude"
+            let name = Providers.info(account.provider).name
             HStack(spacing: zoomed(8)) {
                 Image(systemName: "person.crop.circle.badge.exclamationmark").foregroundStyle(.orange)
                 Text("\(name) needs you to sign in again.").lineLimit(1)
@@ -841,6 +956,21 @@ struct SignInBanner: View {
                 Spacer(minLength: zoomed(6))
                 Button("Sign in…") { app.signIn(account) }
                     .tip("Opens Terminal on \(name)'s own sign-in for this login")
+                Button("Send again") { app.sendAgain(thread.id) }
+                    .tip("Send your last message again, once you've signed in")
+            }
+            .font(.system(size: TypeScale.label))
+            .padding(.horizontal, zoomed(14))
+            .padding(.vertical, zoomed(7))
+            .overlay(alignment: .bottom) { Rectangle().fill(Color(nsColor: Theme.hairline)).frame(height: 0.5) }
+        } else if let runner = app.remoteSignInRunner(for: thread) {
+            // Another Mac's login: signed in on that Mac, not from here.
+            let name = Providers.info(thread.provider).name
+            HStack(spacing: zoomed(8)) {
+                Image(systemName: "person.crop.circle.badge.exclamationmark").foregroundStyle(.orange)
+                Text("\(name) on \(runner) needs you to sign in again.").lineLimit(1)
+                    .tip("Sign in on \(runner) itself: \(Providers.info(thread.provider).loginCommand) in its Terminal")
+                Spacer(minLength: zoomed(6))
                 Button("Send again") { app.sendAgain(thread.id) }
                     .tip("Send your last message again, once you've signed in")
             }
@@ -861,6 +991,18 @@ private struct ErrorBanner: View {
                 Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
                 Text(message).lineLimit(2).tip(message)
                 Spacer()
+                if app.ownCheckout != nil {
+                    // Spins until the thread is made (it can take a second),
+                    // so it can't be pressed twice.
+                    if app.creatingThread {
+                        SpinnerMark(color: .secondaryLabelColor).frame(width: zoomed(13), height: zoomed(13))
+                            .tip("Starting a thread to look into it")
+                    }
+                    Button("Investigate") { app.investigateError() }
+                        .buttonStyle(.borderless)
+                        .disabled(app.creatingThread)
+                        .tip("Start a thread in Threadbear's own repo to find what caused this and fix it")
+                }
                 Button("Dismiss") { app.errorMessage = nil }
                     .buttonStyle(.borderless)
                     .tip("Hide this message")

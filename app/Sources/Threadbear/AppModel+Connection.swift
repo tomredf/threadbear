@@ -41,6 +41,8 @@ extension AppModel {
                 clis = hello.clis
                 clisSupported = hello.clis.isEmpty ? nil : true
                 runnerUpdates = hello.updates
+                experiments = hello.experiments
+                Providers.update(hello.providers)
                 // An older runner sends no pools; the app then works as it
                 // did before them.
                 pools = hello.pools ?? []
@@ -65,8 +67,12 @@ extension AppModel {
                 // Other runners' threads aren't this runner's to list.
                 for (id, thread) in threads where thread.isRemote && fresh[id] == nil { fresh[id] = thread }
                 threads = fresh
+                // A thread deleted while the app wasn't connected never
+                // reached forget(), so its Terminal shell would run on.
+                Terminals.shared.stopAll(except: list.map(\.id))
                 threadsLoaded = true
                 onThreadsLoaded?()
+                threadCountMayHaveChanged()
                 servePanelRequest()
                 loadSchedules()
                 loadRunners()
@@ -74,6 +80,7 @@ extension AppModel {
                 loadProjects()
                 loadConnectors()
                 loadSettings()
+                loadStandingInstructions()
                 // Other runners' threads come back with their own connection.
                 for session in sessions.values where session.state == .loaded && !viaDirectLink(session.threadId) {
                     await session.subscribe()
@@ -134,8 +141,10 @@ extension AppModel {
             case .threadEvent(let threadId, let event):
                 sessions[threadId]?.receive(event)
                 if case .reviewUpdated(let review) = event.payload { receiveReview(review, threadId: threadId) }
+                if case .buttonUpdated(let button) = event.payload { ReplyButtons.shared.receive(button, threadId: threadId) }
             case .threadDeleted(let threadId):
-                forget(threadId)
+                // A thread that moved away stays, as the other runner's.
+                if !movedAway(threadId) { forget(threadId) }
             case .accountsUpdated(let list):
                 // The runner learned something (its model lists, a
                 // default it saw a turn run on, new usage): replaces
@@ -161,6 +170,8 @@ extension AppModel {
                 connectors = status
             case .settingsUpdated(let settings):
                 receive(settings)
+            case .standingInstructions(let instructions):
+                standingInstructions = instructions
             case .runnerNotice(let level, let message):
                 notice(level: level, message)
             case .runnerUpdates(let updates):
@@ -217,7 +228,7 @@ extension AppModel {
     }
 
     func startRunner() {
-        Task {
+        whileBusy(BusyKey.startRunner) { [self] in
             let result = await RunnerLauncher.start()
             if let failure = result { errorMessage = failure }
             try? await Task.sleep(for: .milliseconds(600))
@@ -245,12 +256,15 @@ extension AppModel {
         apply(thread)
     }
 
-    private func apply(_ thread: ThreadSummary) {
-        let previous = threads[thread.id]
+    private func apply(_ incoming: ThreadSummary) {
+        let previous = threads[incoming.id]
+        let thread = keepingAskedMove(incoming, over: previous)
         threads[thread.id] = thread
+        threadCountMayHaveChanged()
         // The open transcript's "3 sub-agents working in the background"
         // line follows the summary, not the events.
         if previous?.background != thread.background { sessions[thread.id]?.setBackground(thread.background) }
+        if previous?.looseEnds != thread.looseEnds { sessions[thread.id]?.setLooseEnds(thread.looseEnds) }
         // The open sub-agent did something: read its transcript again.
         if let ref = subagentSelection, ref.threadId == thread.id,
            previous?.subagents.first(where: { $0.id == ref.subagentId }) != thread.subagents.first(where: { $0.id == ref.subagentId }) {
@@ -266,6 +280,12 @@ extension AppModel {
         if becameNeedy && !showing && notificationsEnabled && !thread.isRemote {
             Notifier.post(thread: thread)
         }
+        // The ding for a finished thread (Settings > General >
+        // Notifications), wherever you are looking. Not another runner's,
+        // as with notifications, nor a scripted app's.
+        if notificationsEnabled, !thread.isRemote, let previous {
+            DingPlayer.threadChanged(from: previous.status, to: thread.status)
+        }
         if showing && thread.lastSeq > thread.lastSeenSeq && thread.status != .waiting {
             scheduleMarkSeen(thread.id)
         }
@@ -278,7 +298,9 @@ extension AppModel {
         let panel = WindowDock.threadPanel(threadId)
         if dock.layout.contains(panel) { dock.close(panel) }
         threads[threadId] = nil
+        Terminals.shared.stop(threadId: threadId)
         drafts[threadId] = nil
+        contextUsage[threadId] = nil
         if let session = sessions.removeValue(forKey: threadId) { session.unsubscribe() }
         if selection == threadId { selection = nil }
         if subagentSelection?.threadId == threadId { subagentSelection = nil }

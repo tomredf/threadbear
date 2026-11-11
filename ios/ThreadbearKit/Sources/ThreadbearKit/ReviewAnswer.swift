@@ -24,6 +24,7 @@ public struct ReviewAnswer: Sendable, Hashable {
     /// then his reply as he wrote it, then "Notes on <id> (<option>): <note>"
     /// paragraphs (`reviewReply` in runner/src/reviews.ts).
     public static func parse(_ text: String) -> ReviewAnswer? {
+        let text = String(withoutPassedOver(text))
         guard let head = text.firstMatch(of: /^Review: (.+?) \(([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)(?:\n\n|$)/) else { return nil }
         let title = String(head.1)
         var paragraphs = text[head.range.upperBound...].components(separatedBy: "\n\n")[...]
@@ -33,7 +34,10 @@ public struct ReviewAnswer: Sendable, Hashable {
             if first == "Picked none of them." {
                 lines.append(Line(label: title, text: "None of them"))
                 paragraphs = paragraphs.dropFirst()
-            } else if let picked = first.firstMatch(of: /^Picked (.+?)\. (.+?)\.?$/) {
+            // The id can't run past the first ". " (and below, the first
+            // " ("): the plain lazy `.+?` tried every one of them with all
+            // that came after, quadratic on a long line. Same matches.
+            } else if let picked = first.firstMatch(of: /^Picked (.(?:(?!\. ).)*?)\. (.+?)\.?$/) {
                 let id = String(picked.1)
                 lines.append(Line(label: title, text: "Picked \(id): \(bare(String(picked.2), id: id))"))
                 paragraphs = paragraphs.dropFirst()
@@ -51,12 +55,22 @@ public struct ReviewAnswer: Sendable, Hashable {
             if paragraph.hasPrefix("Notes on ") || notes.isEmpty { notes.append(paragraph) } else { notes[notes.count - 1] += "\n\n" + paragraph }
         }
         for part in notes {
-            guard let note = part.firstMatch(of: /^Notes on (.+?) \((.+?)\): ([\s\S]+)$/) else { return nil }
+            guard let note = part.firstMatch(of: /^Notes on (.(?:(?! \().)*?) \((.+?)\): ([\s\S]+)$/) else { return nil }
             let id = String(note.1)
             // With nothing picked, the review's title goes over the first note.
             lines.append(Line(label: (lines.isEmpty ? title + "\n" : "") + "Notes on \(id): \(bare(String(note.2), id: id))", text: String(note.3)))
         }
         return lines.isEmpty ? nil : ReviewAnswer(title: title, lines: lines)
+    }
+
+    /// The runner's last paragraph names the options he passed over, for the
+    /// agent writing follow-ups (`PASSED_OVER_TAIL` in runner/src/reviews.ts);
+    /// his bubble leaves it out.
+    static let passedOverTail = "Don't offer one of these later (a next step, a follow-up) as if it were new: say it's one they passed over."
+
+    static func withoutPassedOver(_ text: String) -> Substring {
+        guard text.hasSuffix(passedOverTail), let start = text.range(of: "\n\nPassed over: ", options: .backwards) else { return Substring(text) }
+        return text[..<start.lowerBound]
     }
 
     /// Agents often title options "A: Summary first", which would read

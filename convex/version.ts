@@ -256,4 +256,70 @@
 // 57: phone:waiting, a thread's sends its runner hasn't applied yet, and
 //    phone:cancel, which takes back one still pending. An older phone
 //    never asks for either.
-export const API_VERSION = 57;
+// 58: sync:runnerOrder and sync:setRunnerOrder, the main Mac's key only:
+//    the same runner order the phone sets (API 56), for the Mac's Settings >
+//    Runners. An older runner sends the Mac no order, and its Settings list
+//    the runners as before.
+// 59: reply buttons (docs/protocol.md, "Reply buttons"). A message row can
+//    carry `buttons`, the state of the buttons its text links ([title](button:<id>)),
+//    which the runner sends again when one is pressed (appendMessages patches
+//    just them); phone:messages returns them, and phone:press queues a `press`
+//    command with { buttonId }. An older runner sends none and fails a press
+//    as unknown; an older phone shows the link as text.
+// 60: sync:sharedThreads, the ids of a runner's rows shared by link, which a
+//    runner checks against its own threads on every start and every hour,
+//    removing ones it deleted and rewriting ones it stopped sharing. And a
+//    runner key can't save a schedule under an id gone from another runner
+//    within the day (scheduleGone). An older runner never asks, and does
+//    as before.
+// 61: an open card's asks can carry `optionNotes`, what each answer does,
+//    so a Mac reading another runner's thread through the relay draws the
+//    card as its own runner's (rows with a line under each answer), not
+//    plain buttons (Mike, 8 Nov, on a Hetzner thread). An older runner sends
+//    none, and an older backend gets the asks without them.
+// 62: phone:slashCommands, which asks a thread's runner for the slash
+//    commands it can run (a `slashCommands` command, answered with its
+//    threads.commands list), and phone:command returns that list as
+//    `result`. An older runner fails it as unknown, and the phone shows no
+//    palette; an older phone never asks.
+// 63: relay:queueCommand takes `images` (storage ids the main Mac's runner
+//    uploaded through relay:pictureUploadUrl and /relay/upload, recorded in
+//    relayUploads) on a send or a create, and gives the command a URL for
+//    each, as a phone's photos have; relay:discardPictures deletes ones that
+//    weren't queued, and sync:pruneFiles any left after a day. A runner
+//    sends pictures to another runner only from 63: an older backend would
+//    drop them and send the words alone.
+// 64: moving a thread to another runner (docs/protocol.md, "Moving a thread
+//    to another runner"; convex/moves.ts). The threadMoves table, startMove
+//    and cancelMove for the main Mac, moves and each step for the move's
+//    own runners, and move chunks through /runner/upload outside a runner
+//    key's picture allowances. An older runner never starts one or watches
+//    its moves, so a move to or from it fails when nobody answers.
+// 65: relay:queueCommand's `call` takes moves.describe (to the runner that
+//    has the thread) and moves.preview (to a move's target, with the
+//    thread's description), for the Mac's Move sheet (threads.movePreview).
+//    Both only plan. An older backend refuses them, and the sheet says so.
+// 66: phone:registerDevice takes `platform: "android"`, for a phone whose
+//    token is a Firebase one (apnsToken keeps its name), and devices:targets
+//    carries it. A push for such a phone goes through the push relay to
+//    Firebase, whatever Apple key the backend has (docs/push-relay.md). An
+//    older backend refuses the argument, so an Android phone registers only
+//    with a backend of 66 or later.
+// 67: sync:heartbeat takes `followProblem`, a runner's own word that it can't
+//    follow GitHub's main (runner/src/follow-origin.ts), and otherRunnersList
+//    and otherRunnersThreads (main key only) give it back. An older
+//    backend's validator refuses the field, so a runner sends it only from 67.
+// 68: relay:queueCommand takes `press` ({ buttonId }) and `slashCommands`
+//    for another runner's thread, as the phone sends them, and
+//    relay:remoteTail and remoteMessages rows carry their `buttons`, so the
+//    main Mac presses reply buttons and lists slash commands on another
+//    runner's thread (docs/parity.md). A runner asks only from 68.
+// 69: phone:interrupt, Stop on the phone and the website: queues an
+//    `interrupt` command for the thread's runner, which runners have applied
+//    since 44. An older phone has no Stop.
+// 70: threads and threadIndex rows carry `recap`, the librarian's recap for
+//    the recap box. A runner sends it only from 70.
+// 71: an open card's asks can carry `run`, a command and the id of the Run
+//    button that runs it (phone:press). A runner sends it only from 71; an
+//    older phone just doesn't show it.
+export const API_VERSION = 71;

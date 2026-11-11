@@ -41,7 +41,10 @@ enum ScreenshotRunner {
         try? await Task.sleep(for: .milliseconds(500))
 
         let only = arguments.firstIndex(of: "--only").flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil }
-        func wanted(_ name: String) -> Bool { only == nil || name.hasPrefix(only!) }
+        // Groups are gated by their number ("12") and take each shot's
+        // full name too ("12c"), so --only 12c runs group 12 rather than
+        // matching nothing and saving no shots at all.
+        func wanted(_ name: String) -> Bool { only == nil || name.hasPrefix(only!) || only!.hasPrefix(name) }
 
         // 1. The demo thread at the bottom: images, a footer and an approval card.
         let demo = "demo_upload_resume"
@@ -229,6 +232,25 @@ enum ScreenshotRunner {
             app.transcript.scrollToBottom()
             try? await Task.sleep(for: .milliseconds(400))
             await capture(window, dir.appendingPathComponent("12c-codex-limit-and-footers.png"))
+            // 12e. The limit box at the top of the composer: the login at
+            // its limit and the thread waiting to carry on by itself, then
+            // 12f with carrying on turned off.
+            if let before = app.threads[codex] {
+                var waiting = before
+                waiting.poolId = nil
+                waiting.waitingForRoom = WaitingForRoom(until: Date().addingTimeInterval(95 * 60))
+                app.failedOnAccount[codex] = waiting.accountId
+                app.threads[codex] = waiting
+                try? await Task.sleep(for: .milliseconds(400))
+                await capture(window, dir.appendingPathComponent("12e-limit-box-waiting.png"))
+                var off = waiting
+                off.waitingForRoom = nil
+                off.carryOnAtReset = false
+                app.threads[codex] = off
+                try? await Task.sleep(for: .milliseconds(400))
+                await capture(window, dir.appendingPathComponent("12f-limit-box-off.png"))
+                app.threads[codex] = before
+            }
         }
         // 13. The composer's pickers for a new thread with a runner older
         // than pools: the accounts with the room each has, then the model
@@ -289,6 +311,27 @@ enum ScreenshotRunner {
                 app.settingsTab = .models
                 try? await Task.sleep(for: .milliseconds(600))
                 await capture(settings, dir.appendingPathComponent("15h-settings-models.png"))
+                // Settings › Runners: every runner in Mike's order, which
+                // the phone shares, each with its drag handle.
+                app.settingsTab = .runners
+                try? await Task.sleep(for: .milliseconds(600))
+                await capture(settings, dir.appendingPathComponent("15i-settings-runners.png"))
+                // The top runner mid-drag, over the third slot, as nothing
+                // can hold a real drag still to photograph it.
+                app.settingsTab = .general
+                app.runnerDragPreview = CGSize(width: 24, height: 84)
+                try? await Task.sleep(for: .milliseconds(300))
+                app.settingsTab = .runners
+                try? await Task.sleep(for: .milliseconds(700))
+                await capture(settings, dir.appendingPathComponent("15j-settings-runners-dragging.png"))
+                // And past the top of the list, the nearest it gets to the group's edge.
+                app.settingsTab = .general
+                app.runnerDragPreview = CGSize(width: -40, height: -60)
+                try? await Task.sleep(for: .milliseconds(300))
+                app.settingsTab = .runners
+                try? await Task.sleep(for: .milliseconds(700))
+                await capture(settings, dir.appendingPathComponent("15k-settings-runners-drag-top.png"))
+                app.runnerDragPreview = nil
                 settings.close()
             } else {
                 print("settings: the window didn't open")
@@ -308,6 +351,18 @@ enum ScreenshotRunner {
             await capture(window, dir.appendingPathComponent("14b-usage-went-back.png"))
             app.usageShown = false
             try? await Task.sleep(for: .milliseconds(300))
+        }
+        // 14r. The Runners panel in Mike's order, then its top card mid-drag
+        // (Mike, 8 Nov: the panel rearranges the same order as Settings).
+        if wanted("14r") {
+            app.runnersShown = true
+            try? await Task.sleep(for: .milliseconds(800))
+            await capture(window, dir.appendingPathComponent("14r-runners-panel.png"))
+            app.runnerPanelDragPreview = CGSize(width: 18, height: 70)
+            try? await Task.sleep(for: .milliseconds(800))
+            await capture(window, dir.appendingPathComponent("14s-runners-panel-dragging.png"))
+            app.runnerPanelDragPreview = nil
+            app.runnersShown = false
         }
         // 15. The sidebar's Projects view: rows under a project's heading
         // name only the thread's other projects, or its folder.

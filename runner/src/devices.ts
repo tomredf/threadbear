@@ -8,6 +8,7 @@
 import type { ConvexSync, Device, DeviceKind } from './sync.ts';
 import { DEVICE_KINDS } from './sync.ts';
 import { ErrorCode, RpcError } from './protocol.ts';
+import { localOnly } from './convex-admin.ts';
 
 export const DEFAULT_DAYS = 90;
 export const MAX_DAYS = 365;
@@ -16,11 +17,9 @@ export type DeviceList = { devices: Device[]; site?: string; reason?: string };
 export type Pairing = { device: Device; pairingLink?: string; signInLink?: string };
 
 // The website is served from the deployment's .convex.site host
-// (docs/website.md); a local or odd URL has no site.
-export function siteOf(url: string | undefined): string | undefined {
-  if (!url || !url.includes('.convex.cloud')) return undefined;
-  return url.replace(/\/+$/, '').replace('.convex.cloud', '.convex.site');
-}
+// (docs/website.md), or a self-hosted backend's sync.site; a local or odd
+// URL has no site.
+export { siteOf } from './convex-admin.ts';
 
 // What the iPhone app scans (ios/ThreadbearKit Pairing.swift): the
 // deployment and the token in a threadbear://pair link, and a
@@ -49,7 +48,7 @@ export function devicesMethods(sync: ConvexSync): Record<string, (p: Record<stri
       const devices = await sync.listTokens().catch((e) => {
         throw new RpcError(ErrorCode.other, (e as Error).message);
       });
-      const site = siteOf(sync.url());
+      const site = sync.site();
       return { devices, ...(site ? { site } : {}) };
     },
     'devices.pair': async (p): Promise<Pairing> => {
@@ -64,8 +63,10 @@ export function devicesMethods(sync: ConvexSync): Record<string, (p: Record<stri
       }
       const url = sync.url();
       if (!url) throw new RpcError(ErrorCode.other, offMessage(sync));
-      const site = siteOf(url);
-      if (kind === 'browser' && !site) throw new RpcError(ErrorCode.other, `The website only runs on a Convex cloud deployment, not ${url}.`);
+      // A pairing link to 127.0.0.1 would send the phone to itself.
+      if (kind === 'phone' && localOnly(url)) throw new RpcError(ErrorCode.other, LOCAL_ONLY_PHONE);
+      const site = sync.site();
+      if (kind === 'browser' && !site) throw new RpcError(ErrorCode.other, `This runner doesn't know where the website is for ${url}. A self-hosted backend needs sync.site in runner.json (docs/self-hosting.md).`);
       let issued: { id: string; token: string; expiresAt: string };
       try {
         issued = await sync.issueToken({ kind: kind as DeviceKind, name: name.trim(), days });
@@ -87,11 +88,13 @@ export function devicesMethods(sync: ConvexSync): Record<string, (p: Record<stri
       }
       if (!found) throw bad(`No phone or browser with id ${id}`);
       const devices = await sync.listTokens().catch(() => [] as Device[]);
-      const site = siteOf(sync.url());
+      const site = sync.site();
       return { devices, ...(site ? { site } : {}) };
     },
   };
 }
+
+export const LOCAL_ONLY_PHONE = "Your backend is on this Mac only (setup --self-hosted --local), so a phone can't reach it. To use the iPhone app, install Tailscale and run ./threadbear setup --self-hosted --tailnet (docs/self-hosting.md).";
 
 function defaultName(kind: DeviceKind): string {
   return kind === 'phone' ? 'iPhone' : 'Browser';

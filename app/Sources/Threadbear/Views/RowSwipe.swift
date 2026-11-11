@@ -55,11 +55,30 @@ final class RowSwipeController {
     /// a swipe it started even if the pointer's no longer there.
     func setHovered(_ hovering: Bool) {
         hovered = hovering
+        // A scroll that started here: the list took the rest of it, its end
+        // included, so nothing else says it's over. Left as it was, this row
+        // would keep listening with the pointer elsewhere, and take a later
+        // gesture's movements as its own.
+        if !hovering, swipe.phase == .ignoring || swipe.phase == .deciding { swipe.reset() }
         updateMonitor()
     }
 
+    /// The pointer's on the row, so a gesture starting now is the row's to
+    /// look at. Not the same as listening, which runs on to a swipe's end.
+    var isHovered: Bool { hovered }
+
     /// The row listening, for scripted swipes.
     static weak var listening: RowSwipeController?
+
+    /// The gesture ended somewhere the row won't hear about: it never
+    /// archives from this, and goes back into place.
+    func cancelGesture() {
+        guard swipe.phase != .idle else { return }
+        eatingMomentum = false
+        swipe.cancel()
+        springBack()
+        updateMonitor()
+    }
 
     /// The row's gone: stop listening whatever it was doing.
     func stop() {
@@ -98,15 +117,24 @@ final class RowSwipeController {
         // isn't a swipe); a trackpad or Magic Mouse does.
         guard event.hasPreciseScrollingDeltas, !event.phase.isEmpty else { return false }
         if event.phase.contains(.began) {
-            guard hovered, !leaving else { return false }
+            guard hovered, !leaving else {
+                // A new gesture elsewhere: whatever this row was doing, its
+                // lift went somewhere else (another app, say).
+                if !leaving { cancelGesture() }
+                return false
+            }
             swipe.begin(rightTaken: SwipeNavigation.shared.takesBack)
             eatingMomentum = false
         }
         if event.phase.contains(.changed) || event.phase.contains(.began) {
-            // Follow the fingers whichever way the system scrolls: with
-            // natural scrolling the delta already goes the fingers' way.
-            let sign: CGFloat = event.isDirectionInvertedFromDevice ? 1 : -1
-            return move(dx: event.scrollingDeltaX * sign, dy: event.scrollingDeltaY)
+            // The row moves the way the system scrolls content, as a page
+            // swipe does: so archiving (the row going left) is never the
+            // same gesture as Back (content going right). With natural
+            // scrolling that's the fingers' way; without, the other way.
+            // It followed the fingers until 9 Nov, and with natural
+            // scrolling off Mike's swipe left over a row archived it where
+            // he meant Back ("Back wins").
+            return move(dx: event.scrollingDeltaX, dy: event.scrollingDeltaY)
         }
         if event.phase.contains(.ended) {
             let wasSwiping = swipe.isSwiping
@@ -190,21 +218,28 @@ final class RowSwipeController {
 enum RowSwipeEvents {
     enum Phase: Int64 {
         // CGScrollPhase's values.
-        case began = 1, changed = 2, ended = 4
+        case began = 1, changed = 2, ended = 4, cancelled = 8, mayBegin = 128
     }
 
     /// `dx` is the fingers' way, left negative, whichever way the
     /// system's scrolling runs.
     /// `middle`: over the middle of the window (a page swipe), rather
     /// than the sidebar's rows.
-    static func event(dx: Double, phase: Phase, middle: Bool = false) -> NSEvent? {
+    /// `content`: `dx` and `dy` are the content's way instead (positive
+    /// right and down as it scrolls), the same whatever the system's
+    /// natural scrolling is: what rows and page swipes go by.
+    static func event(dx: Double, dy: Double = 0, phase: Phase, middle: Bool = false, content: Bool = false) -> NSEvent? {
         guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: 0, wheel2: 0, wheel3: 0) else { return nil }
         cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
         cg.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase.rawValue)
         guard let probe = NSEvent(cgEvent: cg) else { return nil }
-        let delta = probe.isDirectionInvertedFromDevice ? dx : -dx
+        let delta = content || probe.isDirectionInvertedFromDevice ? dx : -dx
         cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: delta)
         cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: delta)
+        // Up and down the way the system scrolls, as across.
+        let vertical = content || probe.isDirectionInvertedFromDevice ? dy : -dy
+        cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: vertical)
+        cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: vertical)
         if let window = NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }) {
             let x = middle ? window.frame.midX : window.frame.minX + 100
             let down = middle ? window.frame.height / 2 : 200

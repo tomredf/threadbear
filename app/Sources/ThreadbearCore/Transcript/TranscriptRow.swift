@@ -99,6 +99,9 @@ public struct UserMessage: Sendable, Hashable {
 
     public enum Pending: Sendable, Hashable {
         case sending, queued
+        /// Held until a restarting runner is back, with a note under the
+        /// bubble saying so (`PendingMessage.waitingForRunner`).
+        case waitingForRunner
     }
 
     public init(text: String, images: [ImageRef] = [], origin: String? = nil, answers: [AskAnswer] = [], editOf: Int? = nil, review: ReviewAnswer? = nil, editable: Bool = false, pending: Pending? = nil) {
@@ -263,6 +266,21 @@ public struct ApprovalItem: Sendable, Hashable {
     /// Another runner asking for a thread: the request as it was filed,
     /// once this Mac's runner has read it (nil until then).
     public var startRequest: StartRequest?
+    /// The agent's other calls waiting behind this one, shown on the same
+    /// card (docs/protocol.md, "Queued calls"). Empty for most cards.
+    ///
+    /// Always empty on another runner's start request, and a start request
+    /// is never one of the queued calls. Both come from the runner that
+    /// owns the thread, which may be a secondary one: a queue on the card
+    /// swapped the request this Mac's runner read (where, which access, the
+    /// brief) for the runner's own harmless-looking calls, while Allow
+    /// still started what was filed (Daybreak, 8 Nov). A start request is
+    /// only ever shown and answered as itself.
+    public var queued: [ApprovalRequest] {
+        get { isStartRequest ? [] : queuedCalls }
+        set { queuedCalls = newValue.filter { $0.name != StartRequest.cardName } }
+    }
+    private var queuedCalls: [ApprovalRequest] = []
 
     public init(request: ApprovalRequest, resolution: ApprovalResolution? = nil, root: String? = nil, toolShown: Bool = false, startRequest: StartRequest? = nil) {
         self.request = request
@@ -315,6 +333,17 @@ public struct SecretItem: Sendable, Hashable {
         case .expired: return request.label + " · Request ended"
         default: return request.label + " · Declined"
         }
+    }
+}
+
+public extension RowContent {
+    /// The note a thread back from hibernating says so in. The runner words
+    /// it (`wake` in runner/src/runner/hibernation.ts), and every way it says
+    /// it starts like this. It's what Mike came to the thread to read, so it
+    /// never folds into the work above it, and it gets the bear.
+    var isWakeNote: Bool {
+        if case .note(let text) = self { return text.hasPrefix("Woke up") }
+        return false
     }
 }
 
@@ -414,9 +443,13 @@ public struct AsksCard: Sendable, Hashable {
     /// picked Something else on, by ask index. The card makes room for
     /// each box from it; the box itself is a text view over that room.
     public var notes: [Int: AskNote]
+    /// The done card's loose ends, as the runner checked them (protocol
+    /// "Loose ends"): nil when it didn't, empty when nothing's left.
+    public var looseEnds: [LooseEnd]?
 
-    public init(seq: Int, asks: [Ask], ticked: Set<Int> = [], isOpen: Bool = true, picks: [Int: Int] = [:], next: [String] = [], notes: [Int: AskNote] = [:], pickedNext: Set<Int> = [], explainNext: Set<Int> = []) {
+    public init(seq: Int, asks: [Ask], ticked: Set<Int> = [], isOpen: Bool = true, picks: [Int: Int] = [:], next: [String] = [], notes: [Int: AskNote] = [:], pickedNext: Set<Int> = [], explainNext: Set<Int> = [], looseEnds: [LooseEnd]? = nil) {
         self.seq = seq
+        self.looseEnds = looseEnds
         self.notes = notes
         self.pickedNext = pickedNext
         self.explainNext = explainNext

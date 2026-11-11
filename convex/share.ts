@@ -12,13 +12,15 @@
 // Mike's own phone or browser token also reads it while it isn't shared,
 // and gets `manage` so the page can offer Stop sharing and Share again
 // (phone:share, a command the runner applies).
-import { v, type Infer } from 'convex/values';
+import { ConvexError, v, type Infer } from 'convex/values';
 import { internalQuery, query, type QueryCtx } from './_generated/server';
 import type { Doc } from './_generated/dataModel';
-import { checkPhoneToken } from './lib';
+import { checkPhoneToken, pageLimit } from './lib';
+import { docBytes } from './runnerAccess';
 
 const PAGE_DEFAULT = 80;
 const PAGE_MAX = 2000;
+const PAGE_BYTES = 8 * 1024 * 1024;
 
 const message = v.object({
   seq: v.number(),
@@ -64,10 +66,19 @@ async function isMike(ctx: QueryCtx, token?: string): Promise<boolean> {
   }
 }
 
-// A thread's uploaded pictures from seq `from` on, with their URLs.
-export async function imagesFrom(ctx: QueryCtx, threadId: string, from: number) {
+// At most this many pictures in one answer, whatever a page asks: each row is
+// a few KB (sync.ts checkPicture), so this keeps a page's pictures to about a
+// MB. The newest, as that's what's on screen; a thread with more than this
+// many from its oldest shown row shows the newest of them.
+export const IMAGES_MAX = 300;
+
+// A thread's uploaded pictures from seq `from` on (before `before`, when it's a
+// page with newer ones after it), with their URLs.
+export async function imagesFrom(ctx: QueryCtx, threadId: string, from: number, before?: number) {
   const out: { seq: number; src?: string; url: string; width?: number; height?: number }[] = [];
-  for await (const img of ctx.db.query('shareImages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId).gte('seq', from))) {
+  const rows = await ctx.db.query('shareImages').withIndex('by_thread_seq', (q) => (before === undefined ? q.eq('threadId', threadId).gte('seq', from) : q.eq('threadId', threadId).gte('seq', from).lt('seq', before))).order('desc').take(IMAGES_MAX);
+  rows.reverse();
+  for (const img of rows) {
     const url = await ctx.storage.getUrl(img.storageId);
     if (!url) continue;
     out.push({ seq: img.seq, ...(img.src ? { src: img.src } : {}), url, ...(img.width ? { width: img.width } : {}), ...(img.height ? { height: img.height } : {}) });
@@ -88,8 +99,9 @@ export const phoneImage = v.object({
   height: v.optional(v.number()),
 });
 
-export async function replyImagesFrom(ctx: QueryCtx, threadId: string, from: number) {
-  const rows = await ctx.db.query('replyImages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId).gte('seq', from)).collect();
+export async function replyImagesFrom(ctx: QueryCtx, threadId: string, from: number, before?: number) {
+  const rows = await ctx.db.query('replyImages').withIndex('by_thread_seq', (q) => (before === undefined ? q.eq('threadId', threadId).gte('seq', from) : q.eq('threadId', threadId).gte('seq', from).lt('seq', before))).order('desc').take(IMAGES_MAX);
+  rows.reverse();
   const inReplies = new Set(rows.filter((r) => r.src).map((r) => r.path));
   const out: { seq: number; src?: string; pinned?: boolean; url: string; width?: number; height?: number }[] = [];
   for (const img of rows) {
@@ -105,7 +117,9 @@ export async function replyImagesFrom(ctx: QueryCtx, threadId: string, from: num
 }
 
 export const view = query({
-  args: { slug: v.string(), token: v.optional(v.string()), limit: v.optional(v.number()) },
+  // beforeSeq: only rows before it, for a page that has scrolled back past
+  // its live first page, read once (web/src/share-history.ts).
+  args: { slug: v.string(), token: v.optional(v.string()), limit: v.optional(v.number()), beforeSeq: v.optional(v.number()) },
   returns: v.union(
     v.object({ state: v.literal('gone') }),
     v.object({
@@ -126,17 +140,23 @@ export const view = query({
       manage: v.optional(v.object({ threadId: v.string(), shared: v.boolean() })),
     }),
   ),
-  handler: async (ctx, { slug, token, limit }) => {
+  handler: async (ctx, { slug, token, limit, beforeSeq }) => {
     const t = await threadBySlug(ctx, slug);
     if (!t?.share) return { state: 'gone' as const };
     const shared = t.share.access === 'link';
     const mike = await isMike(ctx, token);
     if (!shared && !mike) return { state: 'gone' as const };
-    const want = Math.max(1, Math.min(PAGE_MAX, Math.floor(limit ?? PAGE_DEFAULT)));
+    const want = pageLimit(limit, PAGE_DEFAULT, PAGE_MAX);
     const out: Infer<typeof message>[] = [];
+    // At most one more than the page, and PAGE_BYTES of it: a page of big
+    // rows stops short, saying there's more, rather than going past what a
+    // query may read.
     let hasMore = false;
-    for await (const m of ctx.db.query('messages').withIndex('by_thread_seq', (q) => q.eq('threadId', t.threadId)).order('desc')) {
-      if (out.length >= want) {
+    let bytes = 0;
+    if (beforeSeq !== undefined && !Number.isFinite(beforeSeq)) throw new ConvexError({ kind: 'invalid', message: 'beforeSeq must be a number' });
+    const rows = ctx.db.query('messages').withIndex('by_thread_seq', (q) => (beforeSeq === undefined ? q.eq('threadId', t.threadId) : q.eq('threadId', t.threadId).lt('seq', beforeSeq)));
+    for await (const m of rows.order('desc')) {
+      if (out.length >= want || (bytes += docBytes(m)) > PAGE_BYTES) {
         hasMore = true;
         break;
       }
@@ -162,7 +182,8 @@ export const view = query({
       ...(t.working ? { working: t.working } : {}),
       lastActivityAt: t.lastActivityAt,
       messages: out,
-      images: await imagesFrom(ctx, t.threadId, hasMore ? (out[0]?.seq ?? 0) : 0),
+      // The page's pictures only: an older page's stop where the next begins.
+      images: await imagesFrom(ctx, t.threadId, hasMore ? (out[0]?.seq ?? 0) : 0, beforeSeq),
       hasMore,
       ...(mike ? { manage: { threadId: t.threadId, shared } } : {}),
     };

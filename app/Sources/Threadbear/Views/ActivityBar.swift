@@ -31,14 +31,17 @@ struct ActivityBar: View {
             VStack(spacing: zoomed(4)) {
             // How many threads are in the Inbox section, so Mike can see
             // how far off inbox zero he is from any view (29 Oct).
+            // A view's icon brings the Threads panel back if ⌘/ folded it away.
             ActivityButton(symbol: "bubble.left.and.bubble.right", title: "Threads", shortcut: AppShortcuts.shared.display(.showInbox),
                            badge: app.sections.inbox.count, active: app.sidebarMode == .inbox, slides: true) {
+                app.threadsCollapsed = false
                 app.sidebarMode = .inbox
             }
             // Only once the runner has said it knows about schedules.
             if app.schedulesSupported {
                 ActivityButton(symbol: "clock", title: "Scheduled", shortcut: AppShortcuts.shared.display(.showScheduled),
                                badge: app.activeScheduleCount, active: app.sidebarMode == .scheduled, slides: true) {
+                    app.threadsCollapsed = false
                     app.showSchedules()
                 }
             }
@@ -46,12 +49,14 @@ struct ActivityBar: View {
             if app.projectsSupported {
                 ActivityButton(symbol: "square.stack.3d.up", title: "Projects", shortcut: AppShortcuts.shared.display(.showProjects),
                                active: app.sidebarMode == .projects, slides: true) {
+                    app.threadsCollapsed = false
                     app.showProjects()
                 }
                 // A count while it's looking at a thread or has some
                 // waiting: what it's doing and about to do.
                 ActivityButton(symbol: "books.vertical", title: "Librarian", shortcut: AppShortcuts.shared.display(.showLibrarian),
                                badge: app.librarian?.pendingCount, active: app.sidebarMode == .librarian, slides: true) {
+                    app.threadsCollapsed = false
                     app.showLibrarian()
                 }
             }
@@ -75,7 +80,7 @@ struct ActivityBar: View {
             UpdatesActivityButton()
             UsageActivityButton()
             // The same window as ⌘, without a trip to the menu bar.
-            ActivityButton(symbol: "gearshape", title: "Settings", shortcut: "⌘,", active: false) {
+            ActivityButton(symbol: "gearshape", title: "Settings", shortcut: AppShortcuts.shared.display(.settings), active: false) {
                 openSettings()
             }
         }
@@ -84,21 +89,32 @@ struct ActivityBar: View {
         .padding(.bottom, zoomed(10))
         .frame(width: Self.width)
         .frame(maxHeight: .infinity)
+        // Opaque, as the rail on the right is: a dock wider than its room
+        // in a narrow window runs under both.
+        .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .trailing) {
+            // Starts under the title bar strip: the traffic lights are wider
+            // than the bar, so a full-height line cut between the yellow and
+            // green dots (Mike, 9 Nov).
             Rectangle().fill(.separator).frame(width: 0.5)
+                .padding(.top, RootView.options.headerHeight)
         }
     }
 }
 
-/// "Usage": every pool's logins and their room, in a panel of its own
-/// (`UsagePanel`). Toggles it, as VS Code's bar does its views. Its tooltip
+/// "Usage", as a honey pot: every pool's logins and their room, in a panel of
+/// its own (`UsagePanel`). Toggles it, as VS Code's bar does its views. Its tooltip
 /// is the short version: each pool's best room (Mike, 28 Oct).
 private struct UsageActivityButton: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
         let groups = UsageGroups.build(pools: app.poolsSupported ? app.pools : [], accounts: app.accounts)
-        ActivityButton(symbol: WindowDock.usageSymbol, title: "Usage", tip: UsageGroups.tooltip(groups, now: app.now),
+        // Filled to the room on the login the next new thread would use.
+        let login = app.newThreadAccountId
+        let usage = app.draftLogins.account(login)?.usage
+        ActivityButton(custom: AnyView(HoneyPot(level: HoneyLevel.level(usage), login: login)),
+                       title: "Usage", tip: UsageGroups.tooltip(groups, now: app.now),
                        active: app.usageShown) {
             app.usageShown.toggle()
         }
@@ -115,6 +131,8 @@ struct ActivityButton: View {
     /// False draws `image` as it is, in colour: a tool's own icon, which is
     /// how it's recognised. True tints it like the symbols (the bear).
     var tinted = true
+    /// Drawn instead of either (Usage's honey pot).
+    var custom: AnyView? = nil
     let title: String
     /// The tooltip, when it says more than the title (Usage's and Updates'
     /// short summaries).
@@ -211,7 +229,9 @@ struct ActivityButton: View {
 
     @ViewBuilder
     private var icon: some View {
-        if let image {
+        if let custom {
+            custom
+        } else if let image {
             // The bear, tinted like the symbols.
             Image(nsImage: image)
                 .renderingMode(tinted ? .template : .original)

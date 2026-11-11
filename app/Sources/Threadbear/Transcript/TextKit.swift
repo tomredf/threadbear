@@ -10,6 +10,32 @@ final class BackgroundLayoutManager: NSLayoutManager {
     /// view).
     var hoveredRow: NSRange?
 
+    /// The icon of a ```bash box under the pointer (ShellBlockIcons), by
+    /// where the box's text starts.
+    var hoveredShellIcon: (location: Int, icon: ShellBlockIcons.Icon)?
+
+    /// The rounded box around a `.tbBlockBackground` run, in the text
+    /// container's coordinates.
+    func blockBox(_ effective: NSRange, in storage: NSTextStorage, width: CGFloat) -> NSRect? {
+        let glyphs = glyphRange(forCharacterRange: effective, actualCharacterRange: nil)
+        var box = NSRect.null
+        enumerateLineFragments(forGlyphRange: glyphs) { _, used, _, _, _ in
+            box = box.union(used)
+        }
+        guard !box.isNull else { return nil }
+        let style = storage.attribute(.paragraphStyle, at: effective.location, effectiveRange: nil) as? NSParagraphStyle
+        let pad = MarkdownRenderer.codePad
+        // From the first line's indent when it's further left: an
+        // answer row's circle sits left of its words.
+        let head = min(style?.headIndent ?? 0, style?.firstLineHeadIndent ?? 0) - pad
+        // A ```bash box's text stops short of its icons; the box doesn't.
+        let icons = storage.attribute(.tbShellBlock, at: effective.location, effectiveRange: nil) == nil ? 0 : ShellBlockIcons.reserve
+        let tail = width + (style?.tailIndent ?? 0) + pad + icons
+        var rect = NSRect(x: head, y: box.minY - pad, width: max(0, tail - head), height: box.height + pad * 2)
+        rect.origin.y = max(0, rect.origin.y)
+        return rect
+    }
+
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
         guard let storage = textStorage, let container = textContainers.first, storage.length > 0 else { return }
@@ -27,20 +53,7 @@ final class BackgroundLayoutManager: NSLayoutManager {
             var effective = NSRange()
             _ = storage.attribute(.tbBlockBackground, at: range.location, longestEffectiveRange: &effective, in: whole)
             guard drawnBlocks.insert(effective.location).inserted else { return }
-            let glyphs = glyphRange(forCharacterRange: effective, actualCharacterRange: nil)
-            var box = NSRect.null
-            enumerateLineFragments(forGlyphRange: glyphs) { _, used, _, _, _ in
-                box = box.union(used)
-            }
-            guard !box.isNull else { return }
-            let style = storage.attribute(.paragraphStyle, at: effective.location, effectiveRange: nil) as? NSParagraphStyle
-            let pad = MarkdownRenderer.codePad
-            // From the first line's indent when it's further left: an
-            // answer row's circle sits left of its words.
-            let head = min(style?.headIndent ?? 0, style?.firstLineHeadIndent ?? 0) - pad
-            let tail = width + (style?.tailIndent ?? 0) + pad
-            var rect = NSRect(x: head, y: box.minY - pad, width: max(0, tail - head), height: box.height + pad * 2)
-            rect.origin.y = max(0, rect.origin.y)
+            guard var rect = self.blockBox(effective, in: storage, width: width) else { return }
             rect = rect.offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: 0.25, dy: 0.25)
             let path = NSBezierPath(roundedRect: rect, xRadius: zoomed(8), yRadius: zoomed(8))
             color.setFill()
@@ -48,6 +61,15 @@ final class BackgroundLayoutManager: NSLayoutManager {
             Theme.cardBorder.setStroke()
             path.lineWidth = 0.5
             path.stroke()
+            if let command = storage.attribute(.tbShellBlock, at: effective.location, effectiveRange: nil) as? String {
+                let hovered = self.hoveredShellIcon?.location == effective.location ? self.hoveredShellIcon?.icon : nil
+                MainActor.assumeIsolated {
+                    // Drawn for the thread whose transcript this is, never
+                    // the selection's (ShellBlockIcons.shown(in:)).
+                    let threadId = self.textContainers.first?.textView.flatMap { TranscriptTextView.threadId(around: $0) }
+                    ShellBlockIcons.draw(command: command, box: rect, hovered: hovered, threadId: threadId)
+                }
+            }
             // The lines between answer rows, across the box.
             storage.enumerateAttribute(.tbRowRule, in: effective) { rule, ruleRange, _ in
                 guard rule != nil else { return }
@@ -76,6 +98,13 @@ final class BackgroundLayoutManager: NSLayoutManager {
         storage.enumerateAttribute(.tbButton, in: characters) { value, range, _ in
             guard let raw = value as? String, let style = AskButtonStyle(rawValue: raw) else { return }
             drawButton(range, style: style, storage: storage, origin: origin)
+        }
+
+        // By id rather than look, so two pills side by side stay two.
+        storage.enumerateAttribute(.tbReplyButton, in: characters) { value, range, _ in
+            guard value != nil, let raw = storage.attribute(.tbReplyLook, at: range.location, effectiveRange: nil) as? String,
+                  let look = ReplyButtons.Look(rawValue: raw) else { return }
+            drawReplyButton(range, look: look, storage: storage, origin: origin)
         }
 
         storage.enumerateAttribute(.tbLineBackground, in: characters) { value, range, _ in
@@ -128,6 +157,34 @@ final class BackgroundLayoutManager: NSLayoutManager {
             path.fill()
             NSGraphicsContext.restoreGraphicsState()
             style.stroke.setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+    }
+
+    /// A reply button's capsule (MarkdownRenderer.replyButton), one per
+    /// line if a long one wraps, with an edge as in the mockup.
+    private func drawReplyButton(_ range: NSRange, look: ReplyButtons.Look, storage: NSTextStorage, origin: NSPoint) {
+        let font = storage.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont ?? Theme.labelFont
+        let colors = Theme.replyButton(look)
+        let glyphs = glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        enumerateLineFragments(forGlyphRange: glyphs) { fragment, _, textContainer, lineGlyphs, _ in
+            let part = NSIntersectionRange(lineGlyphs, glyphs)
+            guard part.length > 0 else { return }
+            var box = self.boundingRect(forGlyphRange: part, in: textContainer)
+            // The last character's kern is the room after the pill.
+            let last = self.characterIndexForGlyph(at: NSMaxRange(part) - 1)
+            if let kern = storage.attribute(.kern, at: last, effectiveRange: nil) as? CGFloat {
+                box.size.width = max(0, box.width - kern)
+            }
+            let baseline = fragment.minY + self.location(forGlyphAt: part.location).y
+            box.origin.y = baseline - font.ascender - zoomed(3)
+            box.size.height = font.ascender - font.descender + zoomed(6)
+            box = box.insetBy(dx: -MarkdownRenderer.replyPad, dy: 0).offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: 0.5, dy: 0.5)
+            let path = NSBezierPath(roundedRect: box, xRadius: box.height / 2, yRadius: box.height / 2)
+            colors.fill.setFill()
+            path.fill()
+            colors.edge.setStroke()
             path.lineWidth = 1
             path.stroke()
         }
@@ -195,6 +252,14 @@ final class TextMeasurer {
 }
 
 /// A read-only, selectable TextKit 1 text view for transcript text.
+/// A view that holds one thread's transcript text: the transcript table,
+/// or the composer card under it. TranscriptTextView asks the nearest one
+/// whose thread it's in (`transcriptThreadId`).
+@MainActor
+protocol TranscriptThreadHost: AnyObject {
+    var hostedThreadId: String? { get }
+}
+
 final class TranscriptTextView: NSTextView {
     // Clicks count while Threadbear isn't the app in front (FirstClick.swift).
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -238,6 +303,10 @@ final class TranscriptTextView: NSTextView {
 
     override func clicked(onLink link: Any, at charIndex: Int) {
         closeChipCard()
+        forItsThread { followLink(link, at: charIndex) }
+    }
+
+    private func followLink(_ link: Any, at charIndex: Int) {
         // work:, thread: and review: links go somewhere in Threadbear: the
         // row's cell knows which turn the link is in (WorkLinks).
         if let url = link as? URL, WorkLinks.quote(of: url) != nil || WorkLinks.threadId(of: url) != nil || WorkLinks.reviewId(of: url) != nil {
@@ -258,9 +327,42 @@ final class TranscriptTextView: NSTextView {
             // NSWorkspace can't open one (Finder's -50), so it's looked
             // for from the thread's folder like a path in inline code.
             _ = openPathRef(text)
-        } else {
+        } else if webURL(link) != nil {
+            // http(s), checked just above: AppKit hands it to the browser.
             super.clicked(onLink: link, at: charIndex)
+        } else {
+            // Any other scheme (`slack:`, `x-apple.systempreferences:`):
+            // AppKit would start its app on the click alone. OpenGate asks
+            // first, naming the app and the link (Daybreak, 7 Nov).
+            openOtherLink(link)
         }
+    }
+
+    /// A link that's neither a file nor a web page, through OpenGate.
+    var openOtherLink: (Any) -> Void = { link in
+        MainActor.assumeIsolated {
+            guard let url = (link as? URL) ?? (link as? String).flatMap(URL.init(string:)) else { return NSSound.beep() }
+            OpenGate.openLink(url)
+        }
+    }
+
+    /// The thread this text is in, for a transcript row's: a thread open in
+    /// a panel isn't the selected one.
+    var linkThreadId: String? {
+        var view: NSView? = superview
+        while let v = view, !(v is RowCellView) { view = v.superview }
+        return (view as? RowCellView)?.delegate?.linkThreadId
+    }
+
+    /// Runs `body` with this text's thread as the one links are followed
+    /// in (AppModel.linkThreadId), so another Mac's thread in a panel has
+    /// its paths fetched from that Mac, not read as this Mac's.
+    func forItsThread<T>(_ threadId: String? = nil, _ body: () -> T) -> T {
+        let app = AppModel.shared
+        let saved = app.linkThreadId
+        app.linkThreadId = threadId ?? linkThreadId ?? saved
+        defer { app.linkThreadId = saved }
+        return body()
     }
 
     convenience init() {
@@ -440,11 +542,18 @@ final class TranscriptTextView: NSTextView {
         // A draft's Copy (DraftBlockCell).
         if let header = draftHeader(at: point), header.cell.isButton(at: point, in: header.frame) {
             closeChipCard()
-            header.cell.copy()
+            header.cell.copyDraft()
             setNeedsDisplay(header.frame)
+            CopiedBubble.show(above: header.cell.button(in: header.frame), in: self)
             // Back to Copy once Copied has had its moment.
             let frame = header.frame
             DispatchQueue.main.asyncAfter(deadline: .now() + DraftBlockCell.copiedFor + 0.05) { [weak self] in self?.setNeedsDisplay(frame) }
+            return
+        }
+        // A ```bash box's play and copy icons (ShellBlockIcons).
+        if let hit = shellIcon(at: point) {
+            closeChipCard()
+            press(hit)
             return
         }
         // A press on a link (a file, a web page, an asks card's link
@@ -459,6 +568,12 @@ final class TranscriptTextView: NSTextView {
         // file. A picture not here yet (another runner's) falls through.
         if let chip = pictureChip(at: point), pictureGrid?.open(chip) == true {
             closeChipCard()
+            return
+        }
+        // A reply button's pill presses it (or opens what it started).
+        if let id = replyButton(at: point) {
+            closeChipCard()
+            AppModel.shared.pressReplyButton(id, from: transcriptThreadId)
             return
         }
         if let onAction, let action = row(at: point)?.action ?? character(at: point).flatMap({ textStorage?.attribute(.tbAction, at: $0, effectiveRange: nil) as? String }) {
@@ -552,6 +667,68 @@ final class TranscriptTextView: NSTextView {
         return frame.insetBy(dx: 0, dy: -3).contains(point) ? (cell, frame) : nil
     }
 
+    struct ShellIconHit {
+        let command: String
+        let icon: ShellBlockIcons.Icon
+        /// In this view's coordinates.
+        let rect: NSRect
+        /// Where the box's text starts.
+        let location: Int
+    }
+
+    /// The icon of a ```bash box at `point`, if it's on one.
+    func shellIcon(at point: NSPoint) -> ShellIconHit? {
+        guard let manager = layoutManager as? BackgroundLayoutManager, let textContainer, let storage = textStorage, storage.length > 0 else { return nil }
+        let origin = textContainerOrigin
+        let local = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+        let glyph = manager.glyphIndex(for: local, in: textContainer)
+        var index = manager.characterIndexForGlyph(at: glyph)
+        // Past the end of the line, the nearest glyph can be the newline
+        // after the command, which isn't part of the box.
+        if index >= storage.length || storage.attribute(.tbShellBlock, at: index, effectiveRange: nil) == nil { index -= 1 }
+        guard index >= 0, index < storage.length else { return nil }
+        var effective = NSRange()
+        guard let command = storage.attribute(.tbShellBlock, at: index, longestEffectiveRange: &effective, in: NSRange(location: 0, length: storage.length)) as? String,
+              let box = manager.blockBox(effective, in: storage, width: textContainer.size.width) else { return nil }
+        for icon in ShellBlockIcons.shown(in: transcriptThreadId) {
+            let rect = ShellBlockIcons.rect(icon, in: box)
+            if rect.contains(local) { return ShellIconHit(command: command, icon: icon, rect: rect.offsetBy(dx: origin.x, dy: origin.y), location: effective.location) }
+        }
+        return nil
+    }
+
+    func press(_ hit: ShellIconHit) {
+        ShellBlockIcons.markPressed(hit.icon, hit.command)
+        setNeedsDisplay(hit.rect)
+        DispatchQueue.main.asyncAfter(deadline: .now() + ShellBlockIcons.tickFor + 0.05) { [weak self] in self?.setNeedsDisplay(hit.rect) }
+        switch hit.icon {
+        case .copy:
+            ShellBlockIcons.copy(hit.command)
+            CopiedBubble.show(above: hit.rect, in: self)
+        case .put:
+            // The thread this transcript is, so the command only ever goes to
+            // that thread's own shell (AppModel.putInTerminal(_:from:)).
+            AppModel.shared.putInTerminal(ShellBlock(command: hit.command), from: transcriptThreadId) { [weak self] outcome in
+                guard outcome == .busy, let self else { return }
+                // Nothing typed over a running program or someone's own
+                // half-typed line, and the command isn't lost.
+                ShellBlockIcons.clearPressed(.put, hit.command)
+                ShellBlockIcons.copy(hit.command)
+                self.setNeedsDisplay(hit.rect)
+                CopiedBubble.show(above: hit.rect, in: self, text: "Terminal's in use, so it's copied")
+            }
+        }
+    }
+
+    /// Lights up the ```bash icon under the pointer, or none.
+    private func hoverShell(_ hit: ShellIconHit?) {
+        guard let manager = layoutManager as? BackgroundLayoutManager else { return }
+        let was = manager.hoveredShellIcon
+        guard was?.location != hit?.location || was?.icon != hit?.icon else { return }
+        manager.hoveredShellIcon = hit.map { ($0.location, $0.icon) }
+        needsDisplay = true
+    }
+
     private func richFrame(glyph: Int) -> NSRect {
         guard let layoutManager, let textContainer else { return .zero }
         let box = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
@@ -575,7 +752,7 @@ final class TranscriptTextView: NSTextView {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(block.source, forType: .string)
         case .open:
-            RichRenderer.shared.openBeside(block)
+            RichRenderer.shared.openWindow(block)
         }
     }
 
@@ -583,6 +760,7 @@ final class TranscriptTextView: NSTextView {
     /// text or the width changes.
     private func placeRichTips() {
         subviews.filter { $0 is RichTipAnchor }.forEach { $0.removeFromSuperview() }
+        placeShellTips()
         guard let layoutManager, let textContainer, let storage = textStorage, storage.length > 0,
               storage.string.utf16.contains(0xFFFC) else { return }
         layoutManager.ensureLayout(for: textContainer)
@@ -601,6 +779,26 @@ final class TranscriptTextView: NSTextView {
                 guard let rect = layout.buttons[action] else { continue }
                 let anchor = RichTipAnchor(frame: rect)
                 anchor.text = action.tip(cell.block)
+                addSubview(anchor)
+            }
+        }
+    }
+
+    private func placeShellTips() {
+        guard let manager = layoutManager as? BackgroundLayoutManager, let textContainer, let storage = textStorage, storage.length > 0 else { return }
+        let whole = NSRange(location: 0, length: storage.length)
+        var boxes: [NSRange] = []
+        storage.enumerateAttribute(.tbShellBlock, in: whole) { value, range, _ in
+            if value != nil { boxes.append(range) }
+        }
+        guard !boxes.isEmpty else { return }
+        manager.ensureLayout(for: textContainer)
+        let origin = textContainerOrigin
+        for range in boxes {
+            guard let box = manager.blockBox(range, in: storage, width: textContainer.size.width) else { continue }
+            for icon in ShellBlockIcons.shown(in: transcriptThreadId) {
+                let anchor = RichTipAnchor(frame: ShellBlockIcons.rect(icon, in: box).offsetBy(dx: origin.x, dy: origin.y))
+                anchor.text = icon.tip
                 addSubview(anchor)
             }
         }
@@ -748,6 +946,7 @@ final class TranscriptTextView: NSTextView {
             // either, and NSTextView doesn't get to set its I-beam.
             hoverRow(nil)
             hoverChip(nil)
+            hoverShell(nil)
             NSCursor.pointingHand.set()
             return
         }
@@ -755,14 +954,24 @@ final class TranscriptTextView: NSTextView {
         let point = convert(event.locationInWindow, from: nil)
         let chip = chip(at: point)
         let row = onAction == nil ? nil : row(at: point)
+        let shell = shellIcon(at: point)
         hoverRow(row?.range)
-        if chip != nil || row != nil || isAction(at: point) || pictureChip(at: point) != nil || isRichButton(at: point) { NSCursor.pointingHand.set() }
+        hoverShell(shell)
+        if chip != nil || row != nil || shell != nil || isAction(at: point) || pictureChip(at: point) != nil || isRichButton(at: point) { NSCursor.pointingHand.set() }
         if let chip { hoverChip(chip) } else { hoverPeek(peek(at: point)) }
     }
 
-    /// Over a clickable run (an asks card's buttons, "Show 30 more lines").
+    /// Over a clickable run (an asks card's buttons, "Show 30 more lines",
+    /// a reply button).
     private func isAction(at point: NSPoint) -> Bool {
-        onAction != nil && character(at: point).flatMap { textStorage?.attribute(.tbAction, at: $0, effectiveRange: nil) } != nil
+        if replyButton(at: point) != nil { return true }
+        return onAction != nil && character(at: point).flatMap { textStorage?.attribute(.tbAction, at: $0, effectiveRange: nil) } != nil
+    }
+
+    /// The id of the reply button under `point`, if it's one that can be
+    /// clicked: an unknown button is drawn as plain words with no id.
+    func replyButton(at point: NSPoint) -> String? {
+        character(at: point).flatMap { textStorage?.attribute(.tbReplyButton, at: $0, effectiveRange: nil) as? String }
     }
 
     /// A `PointerButton` laid over this text (the done card's "?") is what's
@@ -794,6 +1003,7 @@ final class TranscriptTextView: NSTextView {
         super.mouseExited(with: event)
         hoverChip(nil)
         hoverRow(nil)
+        hoverShell(nil)
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -852,14 +1062,26 @@ final class TranscriptTextView: NSTextView {
     }
 
     private func peek(atCharacter index: Int) -> (range: NSRange, peek: LinkPeek)? {
+        forItsThread { peekInThread(atCharacter: index) }
+    }
+
+    private func peekInThread(atCharacter index: Int) -> (range: NSRange, peek: LinkPeek)? {
         guard let storage = textStorage, index < storage.length else { return nil }
         var range = NSRange()
-        if let peek = storage.attribute(.tbPeek, at: index, effectiveRange: &range) as? LinkPeek { return (range, peek) }
-        if let chip = storage.attribute(.tbPictureChip, at: index, effectiveRange: &range) as? NSNumber,
-           let link = storage.attribute(.link, at: index, effectiveRange: nil) as? URL {
-            // This Mac's copy of a picture on another runner, once there is one.
-            let file = pictureGrid?.localPath(chip.intValue).map { URL(fileURLWithPath: $0) } ?? link
-            return (range, LinkPeek(url: file, title: PictureChip.label(chip.intValue + 1), pictureOnly: true))
+        if let peek = storage.attribute(.tbPeek, at: index, effectiveRange: &range) as? LinkPeek {
+            // An ask's file link in another Mac's thread: only this Mac's copy.
+            guard peek.url.isFileURL else { return (range, peek) }
+            guard let file = localCopy(peek.url) else { return nil }
+            return (range, file == peek.url ? peek : LinkPeek(url: file, title: peek.title, pictureOnly: peek.pictureOnly))
+        }
+        if let chip = storage.attribute(.tbPictureChip, at: index, effectiveRange: &range) as? NSNumber {
+            // The picture grid's file: the picture itself, or this Mac's
+            // whole copy of one on another runner. Nothing while there's no
+            // copy, or no grid to ask: the message's path is that Mac's,
+            // and read here it named a file on this Mac that the drag then
+            // handed out (Daybreak, 7 Nov).
+            guard let file = pictureGrid?.localPath(chip.intValue) else { return nil }
+            return (range, LinkPeek(url: URL(fileURLWithPath: file), title: PictureChip.label(chip.intValue + 1), pictureOnly: true))
         }
         // The longest range, as a link's words can change font part way
         // (a bold word in it) and the card belongs to the whole link.
@@ -867,9 +1089,15 @@ final class TranscriptTextView: NSTextView {
                                            in: NSRange(location: 0, length: storage.length)) else { return nil }
         let words = storage.attributedSubstring(from: range).string.trimmingCharacters(in: .whitespacesAndNewlines)
         if let web = webURL(link) { return (range, LinkPeek(url: web, title: words)) }
-        guard let url = link as? URL, url.isFileURL || FilePathRefs.text(of: url) != nil, let file = fileLinkTarget(url) else { return nil }
+        guard let url = link as? URL, url.isFileURL || FilePathRefs.text(of: url) != nil, let named = fileLinkTarget(url),
+              let file = localCopy(named) else { return nil }
         // The file alone, for its thumbnail: a page's ?query isn't the file's.
         return (range, LinkPeek(url: URL(fileURLWithPath: file.path), title: words))
+    }
+
+    /// What a press on character `index` would drag out (FileDrag).
+    func dragURL(atCharacter index: Int) -> URL? {
+        peek(atCharacter: index).map(\.peek.url)
     }
 
     /// The index of the picture whose chip is under `point`, in Mike's bubble.
@@ -1118,11 +1346,13 @@ final class TranscriptTextView: NSTextView {
         guard !text.isEmpty else { return }
         let app = AppModel.shared
         switch action {
+        // Explain and Quote only put words in front of Mike, so text that
+        // isn't in a thread's transcript goes to the main panel's thread.
         case .explain:
-            guard let threadId = transcriptThreadId else { return }
+            guard let threadId = transcriptThreadId ?? app.selection else { return }
             app.explain(text, message: selectionMessage, in: threadId)
         case .quote:
-            guard let threadId = transcriptThreadId else { return }
+            guard let threadId = transcriptThreadId ?? app.selection else { return }
             app.quoteInComposer(text, in: threadId)
         case .copy:
             let range = selectedRange()
@@ -1131,12 +1361,25 @@ final class TranscriptTextView: NSTextView {
         }
     }
 
-    /// The thread whose transcript this text is in: the main panel's, or
-    /// one open in a panel of its own.
-    private var transcriptThreadId: String? {
-        var view = superview
-        while let v = view, !(v is TranscriptTableView) { view = v.superview }
-        return (view as? TranscriptTableView)?.controller?.session?.threadId ?? AppModel.shared.selection
+    /// The thread whose transcript (or composer card) this text is in: the
+    /// main panel's, or one open in a panel of its own. Nil when it isn't
+    /// in either. A reply button is only pressed from its own thread's
+    /// transcript, so a `button:` link an agent copied from another thread
+    /// can't press that thread's (Codex's review, 7 Nov). Never the main
+    /// panel's selection: a thread in a panel of its own puts its asks in
+    /// a composer card outside any transcript table, and guessing the
+    /// selection there let a restricted thread's card press a full-access
+    /// thread's button (Daybreak, 8 Nov).
+    var transcriptThreadId: String? { Self.threadId(around: self) }
+
+    /// The nearest view above `view` that knows its thread, and its thread.
+    static func threadId(around view: NSView) -> String? {
+        var next = view.superview
+        while let v = next {
+            if let host = v as? TranscriptThreadHost { return host.hostedThreadId }
+            next = v.superview
+        }
+        return nil
     }
 
     func closeSelectionBar() {
@@ -1174,6 +1417,12 @@ final class TranscriptTextView: NSTextView {
         MainActor.assumeIsolated { _ = AppModel.shared.openTranscriptWebLink(url, action) }
     }
 
+    /// The file on this Mac a hover card or a drag may use for a file link
+    /// (AppModel.localCopy): another Mac's only once there's a whole copy.
+    var localCopy: (URL) -> URL? = { url in
+        MainActor.assumeIsolated { AppModel.shared.localCopy(of: url, in: AppModel.shared.linkThread) }
+    }
+
     /// The right-click menu for the file or web link under `point` (in
     /// this view), if there's one there.
     func fileLinkMenu(at point: NSPoint) -> NSMenu? {
@@ -1190,7 +1439,14 @@ final class TranscriptTextView: NSTextView {
         guard let storage = textStorage, index < storage.length, let link = storage.attribute(.link, at: index, effectiveRange: nil) else { return nil }
         if let web = webURL(link) { return WebLinkMenu(url: web, open: openWeb).menu() }
         guard let url = link as? URL, url.isFileURL || FilePathRefs.text(of: url) != nil else { return nil }
-        return FileLinkMenu(file: fileLinkTarget(url), open: openFile).menu()
+        // The menu's choice comes after this returns, so it carries the
+        // thread with it.
+        let threadId = linkThreadId, open = openFile
+        let file = forItsThread(threadId) { fileLinkTarget(url) }
+        return FileLinkMenu(file: file, open: { [weak self] url, action in
+            guard let self else { return }
+            self.forItsThread(threadId) { open(url, action) }
+        }).menu()
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {

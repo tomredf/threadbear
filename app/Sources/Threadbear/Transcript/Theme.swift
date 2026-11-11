@@ -1,6 +1,7 @@
 import AppKit
 import Observation
 import Synchronization
+import ThreadbearCore
 
 /// The window's zoom: ⌘= and ⌘- in the View menu step it through `steps`
 /// (percentages of the design sizes in `TypeScale` and every `zoomed`
@@ -227,6 +228,10 @@ enum Theme {
     static let buttonFill = dynamic(dark: NSColor(white: 1, alpha: 0.12), light: NSColor(white: 1, alpha: 1))
     static let buttonEdge = dynamic(dark: NSColor(white: 1, alpha: 0.08), light: NSColor(white: 0, alpha: 0.18))
     static let faintText = dynamic(dark: NSColor(white: 1, alpha: 0.36), light: NSColor(white: 0, alpha: 0.45))
+    /// The small star beside "Recommended" on the agent's own pick: a muted
+    /// gold, after Ghostex's (Mike liked it over a blue "my pick", 9 Nov 2026).
+    static let recommendedStar = dynamic(dark: NSColor(calibratedRed: 0.86, green: 0.70, blue: 0.33, alpha: 1),
+                                         light: NSColor(calibratedRed: 0.72, green: 0.54, blue: 0.12, alpha: 1))
     /// Work line icons and chevrons.
     static let faintIcon = dynamic(dark: .tertiaryLabelColor, light: NSColor(white: 0, alpha: 0.36))
     /// Work lines and tool output: secondary, a step darker in light mode,
@@ -251,6 +256,34 @@ enum Theme {
         return NSColor.controlAccentColor.withAlphaComponent(dark ? 0.2 : 0.12)
     }
     static let chipText = NSColor.controlAccentColor
+
+    /// A reply button's pill (docs/protocol.md, "Reply buttons"), as in the
+    /// mockup Mike picked (reply-buttons c.html): blue to start a thread,
+    /// purple to message one, green once pressed, grey on its way, red
+    /// when the last press failed. Fill, text and edge.
+    static func replyButton(_ look: ReplyButtons.Look) -> (fill: NSColor, text: NSColor, edge: NSColor) {
+        switch look {
+        case .start: return replyStart
+        case .send: return replySend
+        case .pressed: return replyPressed
+        case .pressing: return replyPressing
+        case .failed: return replyFailed
+        }
+    }
+
+    private static func hex(_ value: UInt32) -> NSColor {
+        NSColor(srgbRed: CGFloat((value >> 16) & 0xFF) / 255, green: CGFloat((value >> 8) & 0xFF) / 255, blue: CGFloat(value & 0xFF) / 255, alpha: 1)
+    }
+
+    private static func replyColors(dark: (UInt32, UInt32, UInt32), light: (UInt32, UInt32, UInt32)) -> (fill: NSColor, text: NSColor, edge: NSColor) {
+        (dynamic(dark: hex(dark.0), light: hex(light.0)), dynamic(dark: hex(dark.1), light: hex(light.1)), dynamic(dark: hex(dark.2), light: hex(light.2)))
+    }
+
+    private static let replyStart = replyColors(dark: (0x2F3B52, 0x9CC2FF, 0x3D5070), light: (0xE6EFFF, 0x1F5FBF, 0xBCD3F5))
+    private static let replySend = replyColors(dark: (0x33304A, 0xC3B5FF, 0x4A4470), light: (0xEFEAFF, 0x5B3FC4, 0xD3C8F5))
+    private static let replyPressed = replyColors(dark: (0x24332A, 0x8FD19E, 0x35503D), light: (0xE5F4E8, 0x2B7A3D, 0xBFE0C6))
+    private static let replyPressing = replyColors(dark: (0x2A2A2C, 0x8E8B86, 0x3A3A3C), light: (0xEEEEF0, 0x8E8E93, 0xD8D8DC))
+    private static let replyFailed = replyColors(dark: (0x3B2626, 0xFF9A8F, 0x5A3535), light: (0xFDECEB, 0xB3261E, 0xF2C4C0))
 
     /// Diff line tints: about 11%, so a diff isn't the loudest thing on screen.
     static let addedBackground = dynamic(dark: NSColor(srgbRed: 0.25, green: 0.78, blue: 0.4, alpha: 0.12),
@@ -311,6 +344,9 @@ enum Theme {
 extension NSAttributedString.Key {
     /// Fill a rounded box behind the whole run (code blocks, cards).
     static let tbBlockBackground = NSAttributedString.Key("tbBlockBackground")
+    /// A ```bash block's command (ShellBlock), on the box's text: the box
+    /// gets the play and copy icons (ShellBlockIcons).
+    static let tbShellBlock = NSAttributedString.Key("tbShellBlock")
     /// Fill each line fragment edge to edge (diff lines).
     static let tbLineBackground = NSAttributedString.Key("tbLineBackground")
     /// A small rounded fill behind just the run's glyphs (inline code).
@@ -350,6 +386,13 @@ extension NSAttributedString.Key {
     /// A hairline across the top of this paragraph, inside its
     /// `.tbBlockBackground` box: the line between an ask's answer rows.
     static let tbRowRule = NSAttributedString.Key("tbRowRule")
+    /// A reply button's pill (`[title](button:<id>)` in a reply): the value
+    /// is the button's id. BackgroundLayoutManager draws the pill in the
+    /// colours of its `ReplyButtons.Look` (`.tbReplyLook`), and a click
+    /// presses it (AppModel.pressReplyButton).
+    static let tbReplyButton = NSAttributedString.Key("tbReplyButton")
+    /// A `ReplyButtons.Look` raw value, beside `.tbReplyButton`.
+    static let tbReplyLook = NSAttributedString.Key("tbReplyLook")
 }
 
 /// How a button on an asks card is drawn (`.tbButton`).

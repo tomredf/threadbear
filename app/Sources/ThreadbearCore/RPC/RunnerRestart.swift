@@ -10,20 +10,48 @@ public struct RunnerStatus: Sendable, Equatable, Decodable {
     public var pendingRestart: PendingRestart?
     /// The Convex deployment the runner mirrors to (`sync.url`), if sync is on.
     public var syncURL: String?
+    /// The website's address as the runner says it (`sync.site`): a
+    /// self-hosted backend serves it on a port of its own. Older runners
+    /// leave it out.
+    public var siteURL: String?
+    /// The backend can't send phone notifications (`sync.pushOff`): a
+    /// self-hosted one, which the push relay doesn't reach.
+    public var pushOff: Bool
 
-    public init(version: String = "", release: String? = nil, running: [String] = [], pendingRestart: PendingRestart? = nil, syncURL: String? = nil) {
+    public init(version: String = "", release: String? = nil, running: [String] = [], pendingRestart: PendingRestart? = nil, syncURL: String? = nil, siteURL: String? = nil, pushOff: Bool = false) {
         self.version = version
         self.release = release
         self.running = running
         self.pendingRestart = pendingRestart
         self.syncURL = syncURL
+        self.siteURL = siteURL
+        self.pushOff = pushOff
     }
 
-    /// The website (docs/website.md) is served from the same deployment's
-    /// .convex.site host, so a thread's link is `<site>/t/<threadId>`.
+    /// The website (docs/website.md): the runner's `sync.site`, else the
+    /// same deployment's .convex.site host, so a thread's link is
+    /// `<site>/t/<threadId>`. https, or plain http to this Mac for a
+    /// backend on this Mac only.
     public var websiteURL: URL? {
+        if let siteURL, let url = URL(string: siteURL), url.scheme == "https" || (url.scheme == "http" && Self.isLoopback(url)) { return url }
         guard let syncURL, syncURL.contains(".convex.cloud") else { return nil }
         return URL(string: syncURL.replacingOccurrences(of: ".convex.cloud", with: ".convex.site"))
+    }
+
+    /// The backend is on this Mac only (`setup --self-hosted --local`,
+    /// docs/self-hosting.md): `sync.url` is on 127.0.0.1. No phone can pair
+    /// with it, and the website and share links only open on this Mac.
+    public var localOnly: Bool {
+        guard let syncURL, let url = URL(string: syncURL) else { return false }
+        return Self.isLoopback(url)
+    }
+
+    /// The same hosts the runner counts as this Mac (runner/src/secure-url.ts).
+    static func isLoopback(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        if host == "localhost" || host == "::1" || host == "[::1]" { return true }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts[0] == "127" && parts.allSatisfy { UInt8($0) != nil }
     }
 
     public init(from decoder: Decoder) throws {
@@ -32,10 +60,13 @@ public struct RunnerStatus: Sendable, Equatable, Decodable {
         release = try? c.decodeIfPresent(String.self, forKey: .release)
         running = ((try? c.decodeIfPresent([String].self, forKey: .running)) ?? nil) ?? []
         pendingRestart = try? c.decodeIfPresent(PendingRestart.self, forKey: .pendingRestart)
-        syncURL = (try? c.decodeIfPresent(Sync.self, forKey: .sync))?.url
+        let sync = try? c.decodeIfPresent(Sync.self, forKey: .sync)
+        syncURL = sync?.url
+        siteURL = sync?.site
+        pushOff = sync?.pushOff ?? false
     }
 
-    private struct Sync: Decodable { var url: String? }
+    private struct Sync: Decodable { var url: String?; var site: String?; var pushOff: Bool? }
 
     enum CodingKeys: String, CodingKey { case version, release, running, pendingRestart, sync }
 }
@@ -123,7 +154,7 @@ public struct RunnerRestart: Sendable, Equatable {
         let numbers = rest.split { !$0.isNumber }.compactMap { Int($0) }
         let answerAt = rest.range(of: "you answer ")
         let onYou = answerAt.map { rest[$0.upperBound...].prefix { $0.isNumber } }.flatMap { Int($0) } ?? 0
-        return .pending(max(1, numbers.reduce(0, +)), onYou: onYou)
+        return .pending(max(1, numbers.reduce(0) { $0.adding(saturating: $1) }), onYou: onYou)
     }
 
     /// Returns true when the notice was about a restart, so the caller can

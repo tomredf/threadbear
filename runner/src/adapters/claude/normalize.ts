@@ -8,6 +8,7 @@ import type { AdapterOutput, AgentWrite, SubagentUpdate, TurnResult } from '../t
 import type { NormalizerContext } from '../context.ts';
 import { EDIT_TOOLS, PlanTracker, computeEditDiff, toolKind, toolTitle, truncateInput } from '../../tools.ts';
 import { diffLines } from '../../diff.ts';
+import { safeEnd } from '../../safe-cut.ts';
 
 // The file helpers moved to ../context.ts so the Codex normaliser shares
 // them; re-exported for the callers and tests that import them from here.
@@ -152,7 +153,7 @@ export class ClaudeNormalizer {
       // and the note says why.
       const text = typeof msg.summary === 'string' && msg.summary.trim() ? oneLineNote(msg.summary) : 'A background task finished.';
       if (this.turn === 'none') this.pendingNote = this.pendingNote ? `${this.pendingNote}\n${text}` : text;
-      else out.push({ kind: 'event', event: { type: 'system.note', text } });
+      else out.push({ kind: 'event', event: { type: 'system.note', text, wake: true } });
     } else if (msg.subtype === 'background_tasks_changed' && Array.isArray(msg.tasks)) {
       const tasks = (msg.tasks as AnyMsg[])
         .filter((t) => !t.ambient && typeof t.task_id === 'string')
@@ -163,6 +164,15 @@ export class ClaudeNormalizer {
       out.push({ kind: 'tasks', tasks });
     } else if (msg.subtype === 'informational' && msg.level === 'warning' && typeof msg.content === 'string') {
       out.push({ kind: 'event', event: { type: 'system.note', text: msg.content } });
+    } else if (msg.subtype === 'permission_denied') {
+      // A call refused without a card (Auto's safety check, a deny rule):
+      // its result tells the agent, and this tells Mike why (David, 8 Nov 2026).
+      const reason = typeof msg.decision_reason === 'string' ? msg.decision_reason.trim().slice(0, 1000) : '';
+      const tool = typeof msg.tool_name === 'string' && msg.tool_name ? msg.tool_name : 'A tool call';
+      if (reason) {
+        const text = msg.decision_reason_type === 'classifier' ? `Auto mode's safety check stopped ${tool}: ${reason}` : `${tool} was refused: ${reason}`;
+        out.push({ kind: 'event', event: { type: 'system.note', text } });
+      }
     }
   }
 
@@ -608,7 +618,8 @@ function truncateText(text: string, itemId: string, ctx: NormalizerContext): { t
   } catch {
     blobPath = undefined;
   }
-  const cut = cutUtf8(text, LIMITS.toolResultText);
+  const bytesCut = cutUtf8(text, LIMITS.toolResultText);
+  const cut = bytesCut.slice(0, safeEnd(text, bytesCut.length));
   return blobPath ? { text: cut, truncated: true, blobPath } : { text: cut, truncated: true };
 }
 

@@ -5,6 +5,12 @@ import SwiftUI
 import ThreadbearCore
 import WebKit
 
+/// The rail's built-in Files panel, below the folder's own panels (such as
+/// Worktrees): the thread's folder to look through.
+enum BuiltinPanels {
+    static let files = "threadbear.files"
+}
+
 /// A pane section as a panel in the window's dock (WindowDock): Highlights,
 /// one of the thread's panels, or Patches, for the thread that's selected,
 /// or on a project's page the project's panels and Patches.
@@ -38,6 +44,11 @@ struct DockPane: View {
                     case .panel(AgentBrowser.panelId):
                         // One per thread, with its own tabs and picture.
                         AgentBrowserPanel(thread: thread).id(thread.id)
+                    case .panel(BuiltinPanels.files):
+                        // The thread's folder, browsed as a folder link is:
+                        // a file opens over it, Back comes back.
+                        PreviewBody(thread: thread, preview: app.filesPanelPreview(for: thread))
+                            .id(thread.id)
                     case .panel(let id):
                         if let panel = thread.panels.first(where: { $0.id == id }) {
                             panelView(panel, in: thread)
@@ -94,11 +105,14 @@ struct DockPaneButtons: View {
                         }
                         PaneHeaderButton(symbol: "arrow.clockwise", help: "Reload panel") { pool.reloadConvex(selected) }
                         PaneHeaderButton(symbol: "arrow.up.right", help: "Open \(selected) in browser") {
-                            if let target = pool.convexBrowserURL(convex) { NSWorkspace.shared.open(target) }
+                            if let target = pool.convexBrowserURL(convex) { OpenGate.openWeb(target) }
                         }
                     } else {
                         PaneHeaderButton(symbol: "arrow.clockwise", help: "Reload panel") { WebPanelPool.shared.reloadIfLoaded(url) }
-                        PaneHeaderButton(symbol: "arrow.up.right", help: "Open in browser") { NSWorkspace.shared.open(url) }
+                        // The panel's page is the patch's or a runner's to say:
+                        // a web page opens, another Mac's file is fetched
+                        // from it, anything else asks (OpenGate).
+                        PaneHeaderButton(symbol: "arrow.up.right", help: "Open in browser") { app.openLink(url, in: thread, external: true) }
                     }
                 }
             }
@@ -237,6 +251,12 @@ struct PanelRail: View {
                     if tabs.contains(where: { $0.state == "yours" }) { app.showPane(.panel(AgentBrowser.panelId)) }
                 }
             }
+            // The thread's folder, in the folder browser.
+            if project == nil {
+                ActivityButton(symbol: "folder", title: "Files", tip: "The files in this thread's folder", active: app.dock.isShowing(BuiltinPanels.files)) {
+                    app.clickRail(.panel(BuiltinPanels.files), in: thread)
+                }
+            }
             Spacer(minLength: zoomed(8))
             if !thread.patches.isEmpty {
                 ActivityButton(symbol: "square.dashed", title: "Patches", badge: thread.patches.count, active: app.dock.isShowing(PaneSection.patchesId)) {
@@ -248,6 +268,9 @@ struct PanelRail: View {
         .padding(.bottom, zoomed(10))
         .frame(width: ActivityBar.width)
         .frame(maxHeight: .infinity)
+        // Opaque: in a narrow window the dock can be wider than its room
+        // and run under the rail, and its text showed through (Wayne, 9 Nov).
+        .background(Color(nsColor: .windowBackgroundColor))
         .overlay(alignment: .leading) {
             Rectangle().fill(.separator).frame(width: 0.5).padding(.vertical, zoomed(4))
         }
@@ -383,11 +406,18 @@ struct PatchesList: View {
                     Text(PatchesList.waitingText(patch, untrusted: untrusted))
                         .font(.system(size: TypeScale.detail))
                         .foregroundStyle(Color(nsColor: Theme.needsYou))
+                    let trusting = app.isTrusting(patch)
                     Button("Trust") { app.trustPatches([patch], in: thread.id) }
                         .controlSize(.small)
-                        .tip(patch.source == "claude"
+                        .disabled(trusting)
+                        .tip(trusting
+                             ? "Trusting it. The runner loads its patches again, which takes a few seconds."
+                             : patch.source == "claude"
                              ? "Let this folder's Claude Code hooks, status line and MCP servers run on your Mac, and its environment settings (which can change where Claude sends your messages) and permission rules apply, from your next message. Open the files below to read them first."
                              : "Load this patch and let its code run on your Mac from now on. Open the file below to read it first.")
+                    if trusting {
+                        SpinnerMark(color: .secondaryLabelColor).frame(width: zoomed(11), height: zoomed(11))
+                    }
                 }
                 // What its permission rules would let run without asking.
                 if let grants = patch.grants, !grants.isEmpty {
@@ -428,7 +458,7 @@ struct PatchesList: View {
             }
             if let file = patch.file {
                 Button {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: file))
+                    app.openFile(file, of: thread)
                 } label: {
                     Text(file.abbreviatingHome)
                         .font(.system(size: TypeScale.small))
@@ -442,7 +472,7 @@ struct PatchesList: View {
                 if patch.untrusted != nil, let helpers = patch.helpers, !helpers.isEmpty {
                     ForEach(helpers, id: \.self) { helper in
                         Button {
-                            NSWorkspace.shared.open(URL(fileURLWithPath: helper))
+                            app.openFile(helper, of: thread)
                         } label: {
                             Text((patch.source == "claude" ? "Also trusts " : "Imports ") + helper.abbreviatingHome)
                                 .font(.system(size: TypeScale.small))
@@ -633,8 +663,8 @@ private struct ConvexPanel: View {
                         .textSelection(.enabled)
                 }
                 HStack(spacing: zoomed(8)) {
-                    if let url = signIn.url.flatMap(URL.init(string:)) {
-                        Button("Open the page again") { NSWorkspace.shared.open(url) }
+                    if let url = signIn.page {
+                        Button("Open the page again") { OpenGate.openWeb(url) }
                             .tip("Open Convex's sign-in page in your browser")
                     }
                     Button("Cancel") { stopSignIn() }
@@ -733,10 +763,17 @@ private struct ConvexPanel: View {
         signIn = ConvexLogin(state: "waiting")
         signInTask = Task {
             var status = await app.convexPanelLogin(threadId: threadId, panelId: panelId, force: force)
-            if case .success(let started) = status, let url = started.url.flatMap(URL.init(string:)) {
-                NSWorkspace.shared.open(url)
+            if case .success(let started) = status, let url = started.page {
+                OpenGate.openWeb(url)
             }
             while !Task.isCancelled, case .success(let now) = status, now.state == "waiting" {
+                // A page that isn't Convex's sign-in, first or on a later
+                // look: nothing to open, and the sign-in stops saying so.
+                if let refused = now.refusedPage {
+                    signIn = nil
+                    signInFailure = refused
+                    return
+                }
                 signIn = now
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled else { return }
@@ -1014,8 +1051,8 @@ final class WebPanelPool: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
         if isConvexView(webView), navigationAction.targetFrame?.isMainFrame ?? true,
            let url = navigationAction.request.url, url.host != Self.convexEmbedded.host,
-           ["http", "https"].contains(url.scheme) {
-            NSWorkspace.shared.open(url)
+           LinkPolicy.web(url) != nil {
+            OpenGate.openWeb(url)
             decisionHandler(.cancel)
             return
         }
@@ -1063,10 +1100,26 @@ final class WebPanelPool: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if isPreviewView(webView) { return nil }
         guard let url = navigationAction.request.url else { return nil }
-        if isConvexView(webView) { NSWorkspace.shared.open(url) } else { webView.load(URLRequest(url: url)) }
+        // A page's window.open goes to the browser only as a web page: the
+        // page chose the address (OpenGate refuses anything else).
+        if isConvexView(webView) { OpenGate.openWeb(url) } else { webView.load(URLRequest(url: url)) }
         return nil
     }
 }
+
+#if DEBUG
+/// What a list or image panel last drew, for the scripted app (AppDump's
+/// `pane`): their rows and pictures live in the views' own state.
+enum PanelDebug {
+    nonisolated(unsafe) static var renders: [String: PanelRender] = [:]
+    nonisolated(unsafe) static var images: [String: NSImage] = [:]
+
+    static func note(_ id: String, _ render: PanelRender?, image: NSImage?) {
+        renders[id] = render
+        images[id] = image
+    }
+}
+#endif
 
 // MARK: - Image panels
 
@@ -1106,8 +1159,18 @@ private struct ImagePanel: View {
                 let result = await app.renderPanel(threadId: threadId, panelId: panel.id, failure: "Couldn't get a picture from the runner.")
                 if Task.isCancelled { return }
                 render = result
+                #if DEBUG
+                PanelDebug.note(panel.id, result, image: result?.image.flatMap { NSImage(contentsOfFile: $0.path) })
+                #endif
                 // A new NSImage each time: the file's name doesn't change.
-                image = result?.image.flatMap { NSImage(contentsOfFile: $0.path) }
+                // Another Mac's picture is that Mac's file, fetched from it,
+                // never this Mac's file at that path (Codex review, 7 Nov).
+                if let path = result?.image?.path, let thread = app.threads[threadId], thread.isRemote {
+                    let copy = try? await app.remoteCopy(path, in: thread)
+                    image = copy.flatMap { $0.truncated ? nil : NSImage(contentsOf: $0.url) }
+                } else {
+                    image = result?.image.flatMap { NSImage(contentsOfFile: $0.path) }
+                }
                 try? await Task.sleep(for: .seconds(result?.image == nil ? 5 : 3))
             }
         }
@@ -1157,6 +1220,9 @@ private struct ListPanel: View {
                 let result = await app.renderPanel(threadId: thread.id, panelId: panel.id, failure: "Couldn't get this list from the runner.")
                 if Task.isCancelled { return }
                 render = result ?? PanelRender(note: "Not connected to the runner.")
+                #if DEBUG
+                PanelDebug.note(panel.id, render, image: nil)
+                #endif
                 try? await Task.sleep(for: .seconds(15))
             }
         }

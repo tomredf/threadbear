@@ -253,6 +253,9 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
     /// What Mike last said to it, one line (backend API 31): the row's
     /// "You: ...". Nil until he's sent one, and from an older runner.
     public var asked: String?
+    /// The librarian's recap (backend API 70): the recap box above the
+    /// message box. Nil until it has written one, and from an older runner.
+    public var recap: String?
     @OptionalFlexibleDate public var archivedAt: Date?
     /// Mike starred it: the Starred section at the top (backend API 27).
     @OptionalFlexibleDate public var starredAt: Date?
@@ -352,7 +355,7 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
     /// the oldest the phone has. False when the runner doesn't say.
     public func hasEarlier(than oldestSeq: Int?) -> Bool {
         guard let earliestSeq, let oldestSeq else { return false }
-        return oldestSeq > Int(earliestSeq)
+        return Double(oldestSeq) > earliestSeq
     }
 
     /// The last folder name, for a thread in no project: "misc".
@@ -448,8 +451,10 @@ public struct PhoneWaitingForRoom: Codable, Sendable, Hashable {
     }
 }
 
-/// A row of phone:schedules: a message the runner sends by itself, once or
-/// on a cron. The phone reads only what the inbox's Waiting section needs.
+/// A row of phone:schedules or phone:wakes: a message the runner sends by
+/// itself, once or on a cron. The phone reads only what the inbox's
+/// Hibernating section needs, and from phone:wakes (backend API 45) only the
+/// id, threadId and nextRunAt.
 public struct PhoneSchedule: Codable, Sendable, Hashable, Identifiable {
     public var id: String
     public var runnerId: String?
@@ -525,9 +530,12 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
     /// On the first row of a turn the agent started by itself: the
     /// sub-agents and jobs whose finishing woke it (backend API 33).
     public var wokeBy: [WokeTask]?
+    /// The reply buttons its text links as `[title](button:<id>)`, as they
+    /// are now (backend API 59, ReplyButtons.swift).
+    public var buttons: [MessageButton]?
     @FlexibleDate public var at: Date
 
-    public init(seq: Int, role: Role, text: String, origin: String? = nil, toolKind: String? = nil, summary: Bool = false, turn: String? = nil, wokeBy: [WokeTask]? = nil, at: Date) {
+    public init(seq: Int, role: Role, text: String, origin: String? = nil, toolKind: String? = nil, summary: Bool = false, turn: String? = nil, wokeBy: [WokeTask]? = nil, buttons: [MessageButton]? = nil, at: Date) {
         self.seq = seq
         self.role = role
         self.text = text
@@ -536,15 +544,19 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         self.summary = summary
         self.turn = turn
         self.wokeBy = wokeBy
+        self.buttons = buttons
         self._at = FlexibleDate(wrappedValue: at)
     }
 
-    private enum Keys: String, CodingKey { case seq, role, text, origin, toolKind, summary, turn, wokeBy, at }
+    private enum Keys: String, CodingKey { case seq, role, text, origin, toolKind, summary, turn, wokeBy, buttons, at }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         // Convex numbers are float64, so seq comes back as 12.0.
-        seq = Int(try c.decode(Double.self, forKey: .seq))
+        guard let seq = try c.decode(Double.self, forKey: .seq).wholeCount() else {
+            throw DecodingError.dataCorruptedError(forKey: .seq, in: c, debugDescription: "Not a seq")
+        }
+        self.seq = seq
         role = try c.decode(Role.self, forKey: .role)
         text = try c.decode(String.self, forKey: .text)
         origin = try c.decodeIfPresent(String.self, forKey: .origin)
@@ -552,6 +564,7 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         summary = (try? c.decodeIfPresent(Bool.self, forKey: .summary)).flatMap { $0 } ?? false
         turn = try? c.decodeIfPresent(String.self, forKey: .turn)
         wokeBy = (try? c.decodeIfPresent([WokeTask].self, forKey: .wokeBy)).flatMap { $0 }
+        buttons = (try? c.decodeIfPresent([MessageButton].self, forKey: .buttons)).flatMap { $0 }
         _at = try c.decode(FlexibleDate.self, forKey: .at)
     }
 
@@ -565,6 +578,7 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         if summary { try c.encode(true, forKey: .summary) }
         try c.encodeIfPresent(turn, forKey: .turn)
         try c.encodeIfPresent(wokeBy, forKey: .wokeBy)
+        try c.encodeIfPresent(buttons, forKey: .buttons)
         try c.encode(_at, forKey: .at)
     }
 }
@@ -600,9 +614,9 @@ public struct MessagePage: Codable, Sendable, Hashable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        messages = try c.decode([PhoneMessage].self, forKey: .messages)
+        messages = try c.decode(LossyList<PhoneMessage>.self, forKey: .messages).elements
         hasMore = try c.decode(Bool.self, forKey: .hasMore)
-        images = try c.decodeIfPresent([MessageImage].self, forKey: .images) ?? []
+        images = ((try? c.decodeIfPresent(LossyList<MessageImage>.self, forKey: .images)) ?? nil)?.elements ?? []
     }
 }
 
@@ -642,6 +656,39 @@ public struct ThreadPictures: Sendable, Hashable {
         let matching = images.filter { $0.src == src }
         guard let seq else { return matching.last }
         return matching.first { $0.seq == seq } ?? matching.last { $0.seq <= seq } ?? matching.last
+    }
+
+    /// The photos Mike sent with his message at `seq`, in their order, as
+    /// the runner put them up (`src` picture:N, share-images.ts
+    /// pastedImagesInEvent). Empty when they stayed on the Mac.
+    public func pasted(seq: Int) -> [MessageImage] {
+        images
+            .compactMap { image -> (Int, MessageImage)? in
+                guard image.seq == seq, let n = Self.pictureNumber(image.src) else { return nil }
+                return (n, image)
+            }
+            .sorted { $0.0 < $1.0 }
+            .map(\.1)
+    }
+
+    /// His message's words for the bubble, with the runner's "[2 pictures]"
+    /// line (sync.ts toMessageDoc) taken off once every picture it counts
+    /// is here to show instead. While any of them is missing the line stays,
+    /// so a photo kept on the Mac still says it was there.
+    public func words(of text: String, seq: Int) -> String {
+        guard let match = text.firstMatch(of: /(?:\n\n)?\[([1-9]\d{0,2}) pictures?\]$/),
+              let count = Int(match.1) else { return text }
+        let placed = Set(InlinePictures.pieces(text).compactMap { piece -> Int? in
+            if case .picture(let n) = piece { n } else { nil }
+        })
+        let unplaced = pasted(seq: seq).filter { !placed.contains(Self.pictureNumber($0.src) ?? 0) }
+        guard unplaced.count >= count else { return text }
+        return String(text[..<match.range.lowerBound])
+    }
+
+    static func pictureNumber(_ src: String?) -> Int? {
+        guard let src, src.hasPrefix("picture:"), let n = Int(src.dropFirst(8)), n > 0 else { return nil }
+        return n
     }
 
     /// A web picture needs nothing uploaded. Anything else unmatched is on
@@ -719,6 +766,48 @@ public struct ThreadDetail: Codable, Sendable, Hashable {
         self.thread = thread
         self.messages = messages
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        thread = try c.decode(PhoneThread.self, forKey: .thread)
+        messages = ((try? c.decodeIfPresent(LossyList<PhoneMessage>.self, forKey: .messages)) ?? nil)?.elements ?? []
+    }
+}
+
+/// A list read one item at a time: an item this build can't read (a role
+/// it doesn't know, a field shaped the way a newer backend sends it) is
+/// skipped and the rest still show. Decoded as a plain array, one such
+/// message hid the whole thread page, and one such row ended a live list
+/// (9 Nov review). As the Mac's LossyArray.
+public struct LossyList<Element: Decodable>: Decodable {
+    public var elements: [Element]
+
+    public init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var elements: [Element] = []
+        while !container.isAtEnd {
+            if let element = try? container.decode(Element.self) {
+                elements.append(element)
+            } else if (try? container.decode(JSONValue.self)) == nil {
+                // Can't even step past it: stop rather than spin.
+                break
+            }
+        }
+        self.elements = elements
+    }
+}
+
+extension LossyList: Sendable where Element: Sendable {}
+
+/// A list the backend's answers decode leniently (Backend.decode).
+protocol LossyListDecodable {
+    static func decodeLossily(_ data: Data) throws -> Any
+}
+
+extension Array: LossyListDecodable where Element: Decodable {
+    static func decodeLossily(_ data: Data) throws -> Any {
+        try JSONDecoder().decode(LossyList<Element>.self, from: data).elements
+    }
 }
 
 public struct PhoneRunner: Codable, Sendable, Hashable, Identifiable {
@@ -758,10 +847,15 @@ public struct PhoneIdentity: Codable, Sendable, Hashable {
     /// The backend's API version (convex/version.ts). Missing from backends
     /// deployed before there was one.
     public var apiVersion: Int?
-    public init(name: String, expiresAt: Date?, apiVersion: Int? = nil) {
+    /// The backend can't send notifications (a self-hosted one, which the
+    /// push relay doesn't reach: docs/self-hosting.md). Missing means it can.
+    public var pushOff: Bool?
+    public var sendsNotifications: Bool { pushOff != true }
+    public init(name: String, expiresAt: Date?, apiVersion: Int? = nil, pushOff: Bool? = nil) {
         self.name = name
         self._expiresAt = OptionalFlexibleDate(wrappedValue: expiresAt)
         self.apiVersion = apiVersion
+        self.pushOff = pushOff
     }
 }
 
@@ -826,6 +920,9 @@ public enum BackendCompatibility {
     /// From 43 phone:threadsSince: the inbox's changes rather than the whole
     /// list for every row written.
     public static let threadChangesAPIVersion = 43
+    /// From 45 phone:wakes, a small row per active schedule, for the
+    /// inbox's Hibernating section. Older backends get phone:schedules whole.
+    public static let wakesAPIVersion = 45
     /// From 56 runners have an order (phone:setRunnerOrder) and phone:runners
     /// lists them in it, so the new thread sheet can offer a runner, starting
     /// on the first one online. Older backends get no runner picker.
@@ -834,6 +931,17 @@ public enum BackendCompatibility {
     /// taken yet, and phone:cancel takes one back. Older backends have
     /// neither, so the phone only shows a line for the last one it sent.
     public static let waitingSendsAPIVersion = 57
+    /// From 62 phone:slashCommands asks a thread's runner for its slash
+    /// commands, for the palette over the reply box. Older backends get no
+    /// palette; what's typed still runs as a command.
+    public static let slashCommandsAPIVersion = 62
+    /// From 69 phone:interrupt stops a thread's running turn, so Send turns
+    /// into Stop while one runs with nothing typed. Older backends have no Stop.
+    public static let stopAPIVersion = 69
+    /// From 37 phone:images watches a thread's pictures from a seq on, so a
+    /// picture that finishes uploading after its row has left the live page
+    /// still turns up.
+    public static let imagesAPIVersion = 37
 
     /// The line to show, or nil when the backend is fine.
     public static func problem(_ identity: PhoneIdentity) -> String? {
@@ -851,10 +959,24 @@ public struct CommandStatus: Codable, Sendable, Hashable {
     public var state: CommandState
     public var note: String?
     public var threadId: String?
-    public init(state: CommandState, note: String? = nil, threadId: String? = nil) {
+    /// A slashCommands command's answer (API 62): phone:command's `result`.
+    /// Anything that isn't a list of commands reads as none.
+    public var commands: [SlashCommand]?
+    public init(state: CommandState, note: String? = nil, threadId: String? = nil, commands: [SlashCommand]? = nil) {
         self.state = state
         self.note = note
         self.threadId = threadId
+        self.commands = commands
+    }
+
+    private enum CodingKeys: String, CodingKey { case state, note, threadId, commands = "result" }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        state = try c.decode(CommandState.self, forKey: .state)
+        note = try c.decodeIfPresent(String.self, forKey: .note)
+        threadId = try c.decodeIfPresent(String.self, forKey: .threadId)
+        commands = try? c.decodeIfPresent([SlashCommand].self, forKey: .commands)
     }
 }
 
@@ -873,8 +995,8 @@ public struct PhoneCounts: Codable, Sendable, Hashable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
-        hibernating = Int((try? c.decodeIfPresent(Double.self, forKey: .hibernating)).flatMap { $0 } ?? 0)
-        den = Int((try? c.decodeIfPresent(Double.self, forKey: .den)).flatMap { $0 } ?? 0)
+        hibernating = (try? c.decodeIfPresent(Double.self, forKey: .hibernating)).flatMap { $0 }?.wholeCount() ?? 0
+        den = (try? c.decodeIfPresent(Double.self, forKey: .den)).flatMap { $0 }?.wholeCount() ?? 0
     }
 
     public func encode(to encoder: Encoder) throws {

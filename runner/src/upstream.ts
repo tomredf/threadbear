@@ -17,8 +17,9 @@
 // X.509 signature to gpg and the whole keyring whatever gpg.format says
 // (Gautam's scan, 6 Nov 2026, F5).
 //
-// Tags are fetched into a staging namespace nobody merges from, and copied
-// to refs/threadbear/upstream/ only once they verify; a release there is
+// Tags are fetched into a folder of their own, outside the checkout, a
+// few at a time and with a deadline (stageReleases), and only one that
+// verifies is copied in, to refs/threadbear/upstream/; a release there is
 // never moved to another object, so a tag swapped upstream after it was
 // checked can't change what a bring-in thread merges (F31). Those threads
 // are told the verified commit id, and merge that.
@@ -33,13 +34,14 @@
 // runner staying up says nothing about the apps building. release/2026-11-04
 // to -06 went out not building on Xcode 26.6, and people installing it
 // found out before Mike did (PR #1, Maroš's fork).
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Clock, TimerHandle } from './clock.ts';
 import type { Logger } from './log.ts';
+import { applyKeyChanges, KeysBusy, keysIn, revokedPath, REVOKED_FILE, signerKey, SIGNERS_FILE } from './release-keys.ts';
 
 export const FETCH_INTERVAL_MS = 6 * 60 * 60_000;
 export const PUBLISH_INTERVAL_MS = 60 * 60_000;
@@ -50,9 +52,15 @@ export const FIRST_LOOK_MS = 2 * 60_000;
 // Mike's runner tags it.
 export const SETTLE_MS = 60 * 60_000;
 export const TAG_PREFIX = 'release/';
-// Where upstream's release tags are fetched to, as they are: unchecked,
-// and moved by every fetch. Nothing merges from here.
+// A runner from before 7 Nov fetched every tag here, unchecked; anything
+// left is deleted (checkNow). Now they're staged outside the checkout, in
+// STAGED_NS of a folder of their own (stageReleases).
 const INCOMING_NS = 'refs/threadbear/upstream-incoming/';
+const STAGED_NS = 'refs/incoming/';
+// Upstream's main, staged beside the tags: a release counts only if its
+// commit is on it (security review finding 3, 9 Nov 2026). A key used to
+// sign a tag on a side branch, that never went through main, gets nowhere.
+const STAGED_MAIN = 'refs/incoming-main/main';
 // The releases that verified, copied from INCOMING_NS and never moved once
 // there. Their own namespaces, so the fork's own tags are never touched.
 const REF_NS = 'refs/threadbear/upstream/';
@@ -66,6 +74,9 @@ const FUTURE_SLACK_MS = 2 * 24 * 60 * 60_000;
 const MAX_ANSWERS = 10_000;
 // The most tags one check reads that it hasn't read before.
 const MAX_READS = 20;
+// The most releases older than the newest kept that a check fetches, for
+// their notes (notesSince reads nine).
+const MAX_OLDER = 9;
 
 // A release tag's message lists at most 200 subjects (publishOnce), a few
 // tens of KB; a bigger tag object is turned down unread.
@@ -114,7 +125,30 @@ export type UpstreamStatus = {
 // One GitHub Actions run of a workflow on a commit, as ciVerdict needs it.
 export type CiRun = { workflow: string; name: string; status: string; conclusion: string | null; attempt: number };
 
-export type PublishConfig = { publish: boolean; signingKey?: string };
+// signingKey: a key file, as `git tag -s` takes it (user.signingkey): a
+// plain private key (a fork of a fork, or Mike's before Touch ID), or a
+// Secure Enclave key's handle (`ssh-keygen -K`), which asks for Touch ID
+// on every signature (touchKey, publishOnce). signingProvider: the library
+// such a key signs through, /usr/lib/ssh-keychain.dylib unless set.
+export type PublishConfig = { publish: boolean; signingKey?: string; signingProvider?: string };
+
+// How long the release signature waits for Touch ID before giving up for
+// this hour, and the library a Secure Enclave key signs through on macOS.
+export const TOUCH_SIGN_TIMEOUT_MS = 90_000;
+export const MAC_SK_PROVIDER = '/usr/lib/ssh-keychain.dylib';
+
+// Whether a signing key asks for a touch: a security-key type (sk-…),
+// read from the key's .pub (or the file itself, when it's the .pub).
+export function touchKey(signingKey: string): boolean {
+  for (const f of [signingKey.endsWith('.pub') ? signingKey : `${signingKey}.pub`]) {
+    try {
+      if (/^sk-/.test(fs.readFileSync(f, 'utf8').trim())) return true;
+    } catch {
+      // no .pub beside it: a plain key file
+    }
+  }
+  return false;
+}
 
 export type UpstreamDeps = {
   home: string;
@@ -126,6 +160,10 @@ export type UpstreamDeps = {
   // Whether main's tip is what this runner runs, and it has been marked
   // good and up for SETTLE_MS (main.ts). Only asked when publishing.
   runningMainSettled?: () => boolean;
+  // Whether Mike is at this Mac (presence.ts): a release signed with a
+  // Touch ID key is only tried then, so the prompt never sits on an empty
+  // desk. Only asked for such a key.
+  atMac?: () => Promise<boolean>;
   onChange?: () => void;
   // After every check that got as far as the releases, with what it found
   // (bring-in.ts decides from it whether to start a thread).
@@ -135,8 +173,12 @@ export type UpstreamDeps = {
   // lines. Nothing, or a failure, leaves them out; the release goes out anyway.
   writeNotes?: (commits: string) => Promise<string | undefined>;
   // Replaced in tests.
-  git?: (cwd: string, args: string[]) => Promise<string>;
+  git?: (cwd: string, args: string[], opts?: GitOptions) => Promise<string>;
   gitBytes?: (cwd: string, args: string[]) => Promise<Buffer>;
+  // How long fetching from upstream may take (FETCH_TIMEOUT_MS), and how
+  // much it may bring (STAGE_MAX_BYTES). Tests.
+  fetchTimeoutMs?: number;
+  stageMaxBytes?: number;
   // The Actions runs on a commit, from GitHub (githubRuns). Replaced in tests.
   ciRuns?: (repo: string, commit: string) => Promise<CiRun[]>;
 };
@@ -176,13 +218,115 @@ export function signersPath(home: string): string {
   return path.join(home, 'upstream-signers');
 }
 
-export function gitAsync(cwd: string, args: string[]): Promise<string> {
+// How long one git command may take before it's stopped: a fetch from a
+// remote that answers slowly or never (Daybreak, 7 Nov 2026) held the
+// release check, and every check after it, for good.
+export const GIT_TIMEOUT_MS = 2 * 60_000;
+export const FETCH_TIMEOUT_MS = 5 * 60_000;
+const GIT_MAX_OUTPUT = 16 * 1024 * 1024;
+// The most a release check may fetch before anything is verified: a few
+// days' releases are a few MB, and a fork's checkout already has the rest.
+export const STAGE_MAX_BYTES = 512 * 1024 * 1024;
+
+// The bytes in a folder's files, everything below it.
+function folderBytes(dir: string): number {
+  let total = 0;
+  const walk = (d: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else
+        try {
+          total += fs.lstatSync(p).size;
+        } catch {
+          // gone in between
+        }
+    }
+  };
+  walk(dir);
+  return total;
+}
+
+// input: what it reads on stdin. over: asked every half second while it
+// runs; true stops it (stageReleases' size limit).
+export type GitOptions = { timeoutMs?: number; env?: Record<string, string>; input?: string; over?: () => string | undefined };
+
+export function gitAsync(cwd: string, args: string[], opts: GitOptions = {}): Promise<string> {
+  return runGit(cwd, args, opts).then((out) => out.toString('utf8').trim());
+}
+
+// git in its own process group, so a deadline stops what it started too
+// (git-remote-https, ssh, upload-pack), with a cap on what it may print.
+// GIT_TERMINAL_PROMPT=0: a fetch that wants a password fails rather than
+// hanging the runner on a prompt nobody sees.
+// A bare repo (the check's own staging folder) is named with --git-dir
+// rather than found by looking from inside it: git refuses one it finds under
+// safe.bareRepository=explicit, which Claude's desktop terminal sets in
+// GIT_CONFIG_PARAMETERS, so every release check failed there (a fork's
+// commit, 8 Nov 2026).
+export function bareRepoArgs(cwd: string): string[] {
+  const at = (name: string) => fs.existsSync(path.join(cwd, name));
+  return !at('.git') && at('HEAD') && at('objects') && at('refs') ? ['--git-dir', path.resolve(cwd)] : [];
+}
+
+function runGit(cwd: string, args: string[], opts: GitOptions): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    // GIT_TERMINAL_PROMPT=0: a fetch that wants a password fails rather
-    // than hanging the runner on a prompt nobody sees.
-    execFile('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }, (err, stdout, stderr) => {
-      if (err) reject(new Error(`git ${args.join(' ')} failed: ${String(stderr).trim() || err.message}`));
-      else resolve(stdout.trim());
+    const child = spawn('git', ['-C', cwd, ...bareRepoArgs(cwd), ...args], {
+      stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      detached: true,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...opts.env },
+    });
+    const out: Buffer[] = [];
+    let size = 0;
+    let err = '';
+    let why = '';
+    const stop = (reason: string) => {
+      if (why) return;
+      why = reason;
+      try {
+        process.kill(-child.pid!, 'SIGKILL');
+      } catch {
+        child.kill('SIGKILL');
+      }
+    };
+    const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
+    const timer = setTimeout(() => stop(`timed out after ${Math.round(timeoutMs / 1000)} s`), timeoutMs);
+    const watch = opts.over
+      ? setInterval(() => {
+          const why = opts.over!();
+          if (why) stop(why);
+        }, 500)
+      : undefined;
+    if (opts.input !== undefined) {
+      child.stdin!.on('error', () => undefined);
+      child.stdin!.end(opts.input);
+    }
+    child.stdout!.on('data', (d: Buffer) => {
+      size += d.length;
+      if (size > GIT_MAX_OUTPUT) stop('printed more than 16 MB');
+      else out.push(d);
+    });
+    child.stderr!.on('data', (d: Buffer) => {
+      if (err.length < 8192) err += d.toString('utf8');
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      if (watch) clearInterval(watch);
+      reject(new Error(`git ${args.join(' ')} failed: ${e.message}`));
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (watch) clearInterval(watch);
+      // The reason first: a check's status keeps only the start of it.
+      if (why) reject(new Error(`git ${args.find((a) => !a.startsWith('-') && !a.includes('=')) ?? ''} ${why} (git ${args.join(' ')})`));
+      else if (code !== 0) reject(new Error(`git ${args.join(' ')} failed: ${err.trim() || `exit ${code ?? signal}`}`));
+      else resolve(Buffer.concat(out));
     });
   });
 }
@@ -270,8 +414,19 @@ export class Upstream {
   private readonly answers = new Map<string, SignedTag | null>();
   // Reused if signing or pushing the same release needs another try.
   private noteDraft?: { key: string; lines: string[] };
-  private readonly git: (cwd: string, args: string[]) => Promise<string>;
+  // The newest release that verified and is on upstream's main, for its key
+  // list (keyChanges).
+  private newestVerified?: SignedTag & { tag: string };
+  private readonly git: (cwd: string, args: string[], opts?: GitOptions) => Promise<string>;
   private readonly deps: UpstreamDeps;
+
+  private get fetchTimeoutMs(): number {
+    return this.deps.fetchTimeoutMs ?? FETCH_TIMEOUT_MS;
+  }
+
+  private get stageMaxBytes(): number {
+    return this.deps.stageMaxBytes ?? STAGE_MAX_BYTES;
+  }
 
   constructor(deps: UpstreamDeps) {
     this.deps = deps;
@@ -337,9 +492,50 @@ export class Upstream {
       // Before the fetch, so an upstream that's gone (or made to fail)
       // can't keep an unverified ref there.
       await this.sweep(checkout, signers);
-      await this.git(checkout, ['fetch', '-q', '--no-tags', '--prune', 'upstream', `+refs/tags/${TAG_PREFIX}*:${INCOMING_NS}*`]);
-      await this.promote(checkout, signers);
-      const release = await this.newestSigned(checkout, signers);
+      // What a runner from before this kept unverified here goes: upstream's
+      // tags are only ever staged outside the checkout now (stageReleases).
+      for (const [name, ref] of await this.refs(checkout, INCOMING_NS)) await this.git(checkout, ['update-ref', '-d', INCOMING_NS + name, ref.oid]).catch(() => undefined);
+      // A folder of this check's own, so two Upstreams (a runner handing
+      // over to the next) never share one (Codex's review). One a runner
+      // that was killed left behind goes after an hour.
+      const parent = path.join(this.deps.home, 'runner', 'upstream-fetch');
+      fs.mkdirSync(parent, { recursive: true });
+      for (const old of fs.readdirSync(parent)) {
+        const p = path.join(parent, old);
+        try {
+          // The real clock: it's compared with a file's time.
+          if (Date.now() - fs.statSync(p).mtimeMs > 60 * 60_000) fs.rmSync(p, { recursive: true, force: true });
+        } catch {
+          // gone already
+        }
+      }
+      const work = fs.mkdtempSync(path.join(parent, 'check-'));
+      let release: UpstreamRelease | undefined;
+      try {
+        const staged = await this.stageReleases(checkout, signers, path.join(work, 'git'));
+        await this.promote(checkout, signers, staged);
+        // A release can change which keys count (keyChanges), and so can
+        // another runner's check meanwhile (a handover): then what it found
+        // is worked out again with the keys as they are now, so a release
+        // whose own key was revoked isn't offered, until the keys stayed
+        // the same through a whole look (Codex's reviews). An older
+        // release that still counts takes its place.
+        let settled = false;
+        for (let look = 0; look < 3 && !settled; look++) {
+          if (look) {
+            await this.sweep(checkout, signers);
+            await this.promote(checkout, signers, staged);
+          }
+          const keysBefore = this.signersHash(signers);
+          this.newestVerified = undefined;
+          release = await this.newestSigned(checkout, signers, staged);
+          const changed = release ? await this.keyChanges(checkout, signers) : false;
+          settled = !changed && this.signersHash(signers) === keysBefore;
+        }
+        if (!settled) throw new Error('the release keys kept changing while the check ran; it looks again next time');
+      } finally {
+        fs.rmSync(work, { recursive: true, force: true });
+      }
       if (!release) return this.set({ state: 'idle', checkedAt, reason: 'no signed releases yet' });
       const state = release.changes > 0 ? 'available' : 'idle';
       if (state === 'available' && this.st.release?.tag !== release.tag) this.deps.log.info('a newer release from upstream', { tag: release.tag, changes: release.changes });
@@ -362,6 +558,109 @@ export class Upstream {
     return { origin, upstream };
   }
 
+  // Fetches a bounded few of upstream's release tags into a folder of their
+  // own, where the check reads and verifies them; the checkout gets only a
+  // release that verified (promote). It fetched every release/* tag
+  // upstream had, with all their history, straight into the checkout and
+  // with no deadline, so a hijacked upstream could hold the check or fill
+  // the disk before a signature was looked at (Daybreak, 7 Nov 2026).
+  //
+  // 1. ls-remote lists upstream's release/* tags: names and object ids,
+  //    nothing fetched (a deadline and an output cap, as every git here).
+  // 2. The candidates, by promote's rules (f7ec0661): date names no later
+  //    than a couple of days from now, newest first, at most MAX_READS from
+  //    the newest release kept here on, and the newest few older than it,
+  //    which only the notes read (notesSince). A tag already found unsigned
+  //    is passed over, so a flood of them can't keep a real one out for long.
+  // 3. Those are fetched with their objects going to the folder (git's own
+  //    quarantine, GIT_OBJECT_DIRECTORY), not the checkout's, and no ref of
+  //    the checkout's changes. The folder is a bare repo whose objects fall
+  //    back on the checkout's, so only what's new comes over the network,
+  //    and each candidate is a ref there, refs/incoming/<date>.
+  // checkNow deletes the folder when the check ends, whatever happened, so
+  // what didn't verify, and a fetch cut short, leaves nothing behind.
+  private async stageReleases(checkout: string, signers: string, work: string): Promise<string | undefined> {
+    const listed = await this.git(checkout, ['ls-remote', 'upstream', 'refs/heads/main', `refs/tags/${TAG_PREFIX}*`], { timeoutMs: this.fetchTimeoutMs });
+    // Upstream's main: no main, no release can count (STAGED_MAIN).
+    const mainOid = listed.split('\n').map((l) => l.split('\t')).find(([oid, ref]) => ref === 'refs/heads/main' && oid && OBJECT_ID.test(oid))?.[0];
+    if (!mainOid) return undefined;
+    // A tag object is listed twice, the second time peeled (name^{}): a
+    // name without that points straight at a commit, which is never a
+    // signed release, so it's left out unfetched (promote's rule).
+    const listedOids = new Map<string, string>();
+    const peeled = new Set<string>();
+    for (const line of listed.split('\n')) {
+      const [oid, ref] = line.split('\t');
+      if (!oid || !OBJECT_ID.test(oid) || !ref?.startsWith(`refs/tags/${TAG_PREFIX}`)) continue;
+      const name = ref.slice(`refs/tags/${TAG_PREFIX}`.length);
+      if (name.endsWith('^{}')) peeled.add(name.slice(0, -3));
+      else if (RELEASE_NAME.test(name)) listedOids.set(name, oid);
+    }
+    const offered = new Map([...listedOids].filter(([name]) => peeled.has(name)));
+    // Upstream's main first, into the folder, so a release kept here whose
+    // commit isn't on it goes before the newest kept one sets where the
+    // candidates start: a signed side-branch tag an older runner kept, dated
+    // after every real release, held them all out (Codex's review).
+    const objects = path.resolve(checkout, await this.git(checkout, ['rev-parse', '--git-path', 'objects']));
+    const format = await this.git(checkout, ['rev-parse', '--show-object-format']).catch(() => 'sha1');
+    await this.git(path.dirname(work), ['init', '-q', '--bare', `--object-format=${format}`, work]);
+    fs.writeFileSync(path.join(work, 'objects', 'info', 'alternates'), `${objects}\n`);
+    await this.fetchStaged(checkout, work, objects, ['refs/heads/main']);
+    if (!(await this.git(work, ['cat-file', '-e', `${mainOid}^{commit}`]).then(() => true, () => false))) return undefined;
+    await this.git(work, ['update-ref', STAGED_MAIN, mainOid]);
+    for (const [name, ref] of await this.refs(checkout, REF_NS)) {
+      if (await this.onUpstreamMain(work, `${ref.oid}^{commit}`)) continue;
+      this.deps.log.warn("removed a kept upstream release whose commit isn't on upstream's main", { tag: TAG_PREFIX + name });
+      await this.git(checkout, ['update-ref', '-d', REF_NS + name, ref.oid]).catch(() => undefined);
+    }
+    const kept = await this.refs(checkout, REF_NS);
+    const newest = [...kept.keys()].filter((n) => RELEASE_NAME.test(n)).sort().at(-1) ?? '';
+    const latest = new Date(this.deps.clock.now() + FUTURE_SLACK_MS).toISOString().slice(0, 10);
+    const pinned = this.signersHash(signers);
+    const unsigned = (name: string) => this.answers.get(`${pinned} ${offered.get(name)} ${TAG_PREFIX}${name}`) === null;
+    const names = [...offered.keys()].filter((n) => n <= latest && !unsigned(n)).sort().reverse();
+    const candidates = [...names.filter((n) => n >= newest).slice(0, MAX_READS), ...names.filter((n) => n < newest).slice(0, MAX_OLDER)];
+    if (candidates.length) await this.fetchStaged(checkout, work, objects, candidates.map((n) => `refs/tags/${TAG_PREFIX}${n}`));
+    // The ids ls-remote named, where they came (a tag moved in between
+    // isn't there, and waits for the next check).
+    const updates: string[] = [];
+    for (const name of candidates) {
+      const oid = offered.get(name)!;
+      if (await this.git(work, ['cat-file', '-e', oid]).then(() => true, () => false)) updates.push(`create ${STAGED_NS}${name} ${oid}`);
+    }
+    if (updates.length) await this.git(work, ['update-ref', '--stdin'], { input: updates.join('\n') + '\n' });
+    return work;
+  }
+
+  // Fetches `refs` from upstream into the staging folder's objects, with
+  // no ref of the checkout's changed, bounded in size and time.
+  private async fetchStaged(checkout: string, work: string, objects: string, refs: string[]): Promise<void> {
+    await this.git(
+      checkout,
+      // One pack, never loose objects (unpackLimit), so its size is what's
+      // in objects/pack, watched as it comes: over the limit, it's stopped.
+      // No pruning: fetch.prune or fetch.pruneTags in someone's config
+      // would add refs/tags/*:refs/tags/* and change the checkout's tags
+      // (Codex's review).
+      ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'fetch.writeCommitGraph=false', '-c', 'fetch.unpackLimit=1', '-c', 'transfer.unpackLimit=1',
+        'fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--refmap=', 'upstream',
+        ...refs],
+      {
+        timeoutMs: this.fetchTimeoutMs,
+        env: { GIT_OBJECT_DIRECTORY: path.join(work, 'objects'), GIT_ALTERNATE_OBJECT_DIRECTORIES: objects },
+        over: () => (folderBytes(path.join(work, 'objects')) > this.stageMaxBytes ? `fetched more than ${Math.round(this.stageMaxBytes / 1024 / 1024)} MB` : undefined),
+      },
+    );
+    if (folderBytes(path.join(work, 'objects')) > this.stageMaxBytes) throw new Error(`git fetch from upstream fetched more than ${Math.round(this.stageMaxBytes / 1024 / 1024)} MB`);
+  }
+
+  // Copies a staged release's objects into the checkout (no ref changes).
+  private async bringIn(checkout: string, work: string, name: string): Promise<void> {
+    await this.git(checkout, ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', 'fetch', '-q', '--no-tags', '--no-prune', '--no-prune-tags', '--no-write-fetch-head', '--refmap=', work, `${STAGED_NS}${name}`]);
+  }
+
+
+
   // Takes out anything in REF_NS that doesn't verify: a runner from before
   // this check fetched straight into it, unverified, and so can a
   // rolled-back one. Whatever the name, so nothing is in the way of a
@@ -383,12 +682,18 @@ export class Upstream {
   // verifies; and at most MAX_READS tags read per check. A name already
   // kept keeps its object: a different tag served later under it is a
   // re-tag nobody should merge, so it's said in the log and left out.
-  private async promote(checkout: string, signers: string): Promise<void> {
+  // The tags are the ones stageReleases fetched to `staged`, read there;
+  // only the one kept comes into the checkout.
+  private async promote(checkout: string, signers: string, staged: string | undefined): Promise<void> {
+    if (!staged) return;
     const kept = await this.refs(checkout, REF_NS);
     const newest = [...kept.keys()].filter((n) => RELEASE_NAME.test(n)).sort().at(-1) ?? '';
     const latest = new Date(this.deps.clock.now() + FUTURE_SLACK_MS).toISOString().slice(0, 10);
-    const incoming = [...(await this.refs(checkout, INCOMING_NS))]
-      .filter(([name, ref]) => RELEASE_NAME.test(name) && name >= newest && name <= latest && ref.type === 'tag' && kept.get(name)?.oid !== ref.oid)
+    const incoming = [...(await this.refs(staged, STAGED_NS))]
+      // Not a tag object goes through verified() too, unread, so it's
+      // remembered and stageReleases passes it over next time: a server
+      // can list a commit as a tag (Codex's review).
+      .filter(([name, ref]) => RELEASE_NAME.test(name) && name >= newest && name <= latest && kept.get(name)?.oid !== ref.oid)
       .sort(([a], [b]) => (a < b ? 1 : -1));
     let reads = 0;
     for (const [name, ref] of incoming) {
@@ -397,8 +702,13 @@ export class Upstream {
         this.deps.log.warn('more upstream release tags than one check reads; the rest wait for the next', { from: tag });
         break;
       }
-      if (!(await this.verified(checkout, ref, tag, signers))) {
+      const signed = await this.verified(staged, ref, tag, signers);
+      if (!signed) {
         this.deps.log.warn('skipped an upstream release tag that is not signed with the pinned key', { tag });
+        continue;
+      }
+      if (!(await this.onUpstreamMain(staged, signed.commit))) {
+        this.deps.log.warn("skipped a signed upstream release whose commit isn't on upstream's main", { tag, commit: signed.commit });
         continue;
       }
       const have = kept.get(name);
@@ -409,12 +719,46 @@ export class Upstream {
       // Only if the name is still free (a ref that turned up in between
       // isn't overwritten). A clash with another ref's name fails this one
       // copy, not the whole check.
-      const ok = await this.git(checkout, ['update-ref', REF_NS + name, ref.oid, ''])
+      const ok = await this.bringIn(checkout, staged, name)
+        .then(() => this.git(checkout, ['update-ref', REF_NS + name, ref.oid, '']))
         .then(() => true)
         .catch((e) => (this.deps.log.warn('could not keep a verified release', { tag, error: String(e) }), false));
       // The newest is the one that counts; older ones needn't be read.
       if (ok) break;
     }
+  }
+
+  // What the newest accepted release's commit says about the release keys
+  // (release-keys.ts): a key announced in its scripts/release-signers waits
+  // a week and then counts, one in scripts/release-keys-revoked stops
+  // counting at once. Read from the commit the signature covers.
+  // Whether the keys that count changed.
+  private async keyChanges(checkout: string, signers: string): Promise<boolean> {
+    const signed = this.newestVerified;
+    if (!signed) return false;
+    const signer = signerKey(signed.signature);
+    if (!signer) return false;
+    const file = (f: string) => this.git(checkout, ['show', `${signed.commit}:${f}`]).catch(() => '');
+    const [announced, revoke] = await Promise.all([file(SIGNERS_FILE), file(REVOKED_FILE)]);
+    let change;
+    try {
+      change = applyKeyChanges({ home: this.deps.home, signers, signer, announced: keysIn(announced), revoke: keysIn(revoke), tag: signed.tag, now: this.deps.clock.now() });
+    } catch (e) {
+      // Another runner is at it; the next check reads the release again.
+      if (e instanceof KeysBusy) return false;
+      throw e;
+    }
+    for (const k of change.revoked) this.deps.log.warn('a release revoked a release key; it no longer counts', { key: k.slice(0, 60), tag: signed.tag });
+    for (const k of change.added) this.deps.log.warn('a new release key now counts, announced a week ago by a pinned key', { key: k.slice(0, 60), tag: signed.tag });
+    for (const k of change.refused) this.deps.log.warn("a release tried to revoke a key it can't (only that key or a newer one can)", { key: k.slice(0, 60), tag: signed.tag });
+    if (change.waiting.length) this.deps.log.info('a new release key is waiting out its week before it counts', { keys: change.waiting.map((k) => k.slice(0, 60)), tag: signed.tag });
+    return change.added.length > 0 || change.revoked.length > 0;
+  }
+
+  // Whether `commit` is on upstream's main as this check staged it.
+  private async onUpstreamMain(staged: string, commit: string): Promise<boolean> {
+    if (!(await this.git(staged, ['rev-parse', '--verify', '--quiet', STAGED_MAIN]).then(() => true, () => false))) return false;
+    return this.isAncestor(staged, commit, STAGED_MAIN);
   }
 
   // name (after the namespace) -> the object the ref points at, and its type.
@@ -434,7 +778,7 @@ export class Upstream {
   // newer name can't pass for the newer release), with what main doesn't
   // have. Each is checked again here, by its object id, and the commit is
   // the one its signed text names.
-  private async newestSigned(checkout: string, signers: string): Promise<UpstreamRelease | undefined> {
+  private async newestSigned(checkout: string, signers: string, staged: string | undefined): Promise<UpstreamRelease | undefined> {
     const refs = [...(await this.refs(checkout, REF_NS))].sort(([a], [b]) => (a < b ? 1 : a > b ? -1 : 0));
     for (const [name, ref] of refs) {
       const tag = TAG_PREFIX + name;
@@ -442,6 +786,10 @@ export class Upstream {
       // Only a ref that turned up since promote took out the rest.
       if (!signed) continue;
       const { commit, date } = signed;
+      // Kept by a runner from before this, or upstream's main has moved
+      // away from it since: a release only counts while it's on main.
+      if (!staged || !(await this.onUpstreamMain(staged, commit))) continue;
+      this.newestVerified = { ...signed, tag };
       const range = `refs/heads/main..${commit}`;
       const [count, log, trailers] = await Promise.all([
         this.git(checkout, ['rev-list', '--count', '--no-merges', range]),
@@ -451,7 +799,7 @@ export class Upstream {
       ]);
       const important = parseImportant(trailers);
       const changes = Number(count) || 0;
-      const notes = changes > 0 ? await this.notesSince(checkout, { ...signed, name }, signers) : [];
+      const notes = changes > 0 ? await this.notesSince(checkout, { ...signed, name }, signers, staged) : [];
       return { tag, commit, ...(date ? { date } : {}), changes, subjects: log.split('\n').filter(Boolean), ...(important.length ? { important } : {}), ...(notes.length ? { notes } : {}) };
     }
     return undefined;
@@ -460,10 +808,13 @@ export class Upstream {
   // The notes of each signed release main doesn't have, newest first,
   // stopping at the first one main already has (at most 10). Only the
   // newest is kept in REF_NS (promote), so older ones are read from the
-  // incoming tags, each verified against the pinned key the same way, and
-  // the text comes from the verified bytes, never from a ref git could move.
-  private async notesSince(checkout: string, newest: SignedTag & { name: string }, signers: string): Promise<{ tag: string; lines: string[] }[]> {
-    const older = [...(await this.refs(checkout, INCOMING_NS))]
+  // staged tags (stageReleases), each verified against the pinned key the
+  // same way, and the text comes from the verified bytes, never from a ref
+  // git could move. Their history is only in `staged` (whose objects fall
+  // back on the checkout's), so that's where it's compared with main's.
+  private async notesSince(checkout: string, newest: SignedTag & { name: string }, signers: string, staged: string | undefined): Promise<{ tag: string; lines: string[] }[]> {
+    const main = await this.git(checkout, ['rev-parse', 'refs/heads/main']);
+    const older = [...(staged ? await this.refs(staged, STAGED_NS) : [])]
       .filter(([name]) => RELEASE_NAME.test(name) && name < newest.name)
       .sort(([x], [y]) => (x < y ? 1 : -1))
       .slice(0, 9);
@@ -478,9 +829,9 @@ export class Upstream {
     };
     add(newest.name, newest);
     for (const [name, ref] of older) {
-      const signed = await this.verified(checkout, ref, TAG_PREFIX + name, signers);
-      if (!signed || !(await this.isAncestor(checkout, signed.commit, newest.commit))) continue;
-      if (await this.isAncestor(checkout, signed.commit, 'refs/heads/main')) break;
+      const signed = await this.verified(staged!, ref, TAG_PREFIX + name, signers);
+      if (!signed || !(await this.isAncestor(staged!, signed.commit, newest.commit))) continue;
+      if (await this.isAncestor(staged!, signed.commit, main)) break;
       add(name, signed);
     }
     return out;
@@ -496,15 +847,25 @@ export class Upstream {
   private async verified(checkout: string, ref: Ref, tag: string, signers: string): Promise<SignedTag | undefined> {
     // Not a tag object (a commit or anything else), or one far bigger than
     // any Mike's runner makes, is just not signed: never read.
-    if (!readable(ref)) return undefined;
     const key = this.answerKey(ref, tag, signers);
+    if (!readable(ref)) {
+      // Remembered too, so stageReleases passes over it next time: twenty
+      // oversized tags newer than a real release held every check's places
+      // (Codex's review).
+      if (ref.type && ref.size > 0) this.remember(key, null);
+      return undefined;
+    }
     if (this.answers.has(key)) return this.answers.get(key) ?? undefined;
     const raw = await (this.deps.gitBytes ?? gitBytes)(checkout, ['cat-file', 'tag', ref.oid]);
     const split = splitSignedTag(raw, tag);
-    const signed = split && (await sshVerified(split, signers)) ? split : undefined;
-    if (this.answers.size >= MAX_ANSWERS) this.answers.delete(this.answers.keys().next().value!);
-    this.answers.set(key, signed ?? null);
+    const signed = split && (await sshVerified(split, signers, revokedPath(this.deps.home))) ? split : undefined;
+    this.remember(key, signed ?? null);
     return signed;
+  }
+
+  private remember(key: string, answer: SignedTag | null): void {
+    if (this.answers.size >= MAX_ANSWERS) this.answers.delete(this.answers.keys().next().value!);
+    this.answers.set(key, answer);
   }
 
   private answered(ref: Ref, tag: string, signers: string): boolean {
@@ -512,7 +873,19 @@ export class Upstream {
   }
 
   private answerKey(ref: Ref, tag: string, signers: string): string {
-    return `${createHash('sha256').update(fs.readFileSync(signers)).digest('hex')} ${ref.oid} ${tag}`;
+    return `${this.signersHash(signers)} ${ref.oid} ${tag}`;
+  }
+
+  // The pinned keys and the revoked ones: an answer holds for both as they are.
+  private signersHash(signers: string): string {
+    const revoked = (() => {
+      try {
+        return fs.readFileSync(revokedPath(this.deps.home));
+      } catch {
+        return Buffer.alloc(0);
+      }
+    })();
+    return createHash('sha256').update(fs.readFileSync(signers)).update('\0').update(revoked).digest('hex');
   }
 
   // Mike's runner: tags main's tip as today's release when it's moved since
@@ -530,7 +903,7 @@ export class Upstream {
     const committed = Number(await this.git(checkout, ['log', '-1', '--format=%ct', tip])) * 1000;
     if (now - committed < SETTLE_MS) return undefined;
     // Tags made on another Mac, or by hand, count too.
-    await this.git(checkout, ['fetch', '-q', '--no-tags', 'origin', `+refs/tags/${TAG_PREFIX}*:refs/tags/${TAG_PREFIX}*`]);
+    await this.git(checkout, ['fetch', '-q', '--no-tags', 'origin', `+refs/tags/${TAG_PREFIX}*:refs/tags/${TAG_PREFIX}*`], { timeoutMs: this.fetchTimeoutMs });
     const tag = tagFor(new Date(now));
     const tags = (await this.git(checkout, ['tag', '--list', '--sort=-refname', `${TAG_PREFIX}*`])).split('\n').filter(Boolean);
     if (tags.includes(tag)) return this.hold(undefined);
@@ -548,16 +921,35 @@ export class Upstream {
     // Important commits lead the message, so the release says so wherever
     // it's read (forks find them from the commits' trailers themselves).
     const important = parseImportant(await this.git(checkout, ['log', '--no-merges', '--format=%H%x1f%(trailers:key=Important,valueonly,separator=%x20)', last ? `${last}..${tip}` : tip, '--max-count=200']));
-    const lead = important.length ? important.map((i) => `Important: ${i.why}`).join('\n') + '\n\n' : '';
+    const lead = important.length ? [...new Set(important.map((i) => i.why))].map((w) => `Important: ${w}`).join('\n') + '\n\n' : '';
     const notes = await this.notesFor(checkout, range);
     const whatsNew = notes.length ? `${NOTES_HEADING}\n${notes.map((n) => `- ${n}`).join('\n')}\n\n` : '';
     const message = `Threadbear ${tag.slice(TAG_PREFIX.length)}\n\n${lead}${whatsNew}${CHANGES_HEADING}\n${subjects}\n`;
     const file = path.join(this.deps.home, 'runner', 'release-tag-message.txt');
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, message);
-    await this.git(checkout, ['-c', 'gpg.format=ssh', '-c', `user.signingkey=${publish.signingKey}`, 'tag', '-s', '-F', file, tag, tip]);
+    // A Secure Enclave key asks for Touch ID on every signature (security
+    // review finding 3, 9 Nov 2026): tried only while Mike is at the Mac,
+    // given TOUCH_SIGN_TIMEOUT_MS, and held for the next hourly look if he
+    // doesn't touch it. Nothing waits on it but this look.
+    const touch = touchKey(publish.signingKey);
+    if (touch && !(await (this.deps.atMac?.() ?? Promise.resolve(false)))) {
+      this.hold({ commit: tip, why: 'waiting for you at the Mac to sign it with Touch ID', at: new Date(now).toISOString() });
+      return undefined;
+    }
     try {
-      await this.git(checkout, ['push', '-q', 'origin', `refs/tags/${tag}`]);
+      await this.git(checkout, ['-c', 'gpg.format=ssh', '-c', `user.signingkey=${publish.signingKey}`, 'tag', '-s', '-F', file, tag, tip],
+        touch ? { timeoutMs: TOUCH_SIGN_TIMEOUT_MS, env: { SSH_SK_PROVIDER: publish.signingProvider ?? MAC_SK_PROVIDER } } : {});
+    } catch (e) {
+      if (!touch) throw e;
+      await this.git(checkout, ['tag', '-d', tag]).catch(() => undefined);
+      this.hold({ commit: tip, why: `Touch ID wasn't given for its signature (it waits ${Math.round(TOUCH_SIGN_TIMEOUT_MS / 1000)} s); it asks again next hour`, at: new Date(now).toISOString() });
+      this.deps.log.info('release signature not given; asking again next hour', { tag, error: String(e).slice(0, 200) });
+      return undefined;
+    }
+    this.hold(undefined);
+    try {
+      await this.git(checkout, ['push', '-q', 'origin', `refs/tags/${tag}`], { timeoutMs: this.fetchTimeoutMs });
     } catch (e) {
       // Taken back, so the next look tries the push again.
       await this.git(checkout, ['tag', '-d', tag]).catch(() => undefined);
@@ -589,6 +981,21 @@ export class Upstream {
     return lines;
   }
 
+  // GitHub only runs its checks on a main that's been pushed, and nothing
+  // else pushes it: tb land never does, and on 7 Nov the first gated
+  // release sat behind a main three commits ahead of GitHub's. So a main
+  // that has settled here goes up first (fast-forward only), and its
+  // checks are looked at on the next hourly look. Returns why it's held.
+  private async pushMain(checkout: string, tip: string): Promise<string | undefined> {
+    await this.git(checkout, ['fetch', '-q', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main'], { timeoutMs: this.fetchTimeoutMs });
+    const theirs = await this.git(checkout, ['rev-parse', 'refs/remotes/origin/main']).catch(() => '');
+    if (theirs === tip || (theirs && (await this.isAncestor(checkout, tip, theirs)))) return undefined;
+    if (theirs && !(await this.isAncestor(checkout, theirs, tip))) return "main here and GitHub's main have gone different ways";
+    await this.git(checkout, ['push', '-q', 'origin', `${tip}:refs/heads/main`], { timeoutMs: this.fetchTimeoutMs });
+    this.deps.log.info('pushed main for its checks', { commit: tip });
+    return 'just pushed main to GitHub, so its checks have only started';
+  }
+
   // Why GitHub's checks hold this commit back, or undefined when they
   // don't. A main with no workflows has nothing to wait for. One that has
   // them waits for them, and is held when they can't be read: a release
@@ -599,6 +1006,8 @@ export class Upstream {
     // The URL as configured, not as an insteadOf rewrites it for fetching.
     const key = repoKey(await this.git(checkout, ['config', '--get', 'remote.origin.url']).catch(() => ''));
     if (!key.startsWith('github.com/')) return "origin isn't on GitHub, so its checks can't be read";
+    const pushed = await this.pushMain(checkout, tip);
+    if (pushed) return pushed;
     try {
       return ciVerdict(await (this.deps.ciRuns ?? githubRuns)(key.slice('github.com/'.length), tip));
     } catch (e) {
@@ -648,12 +1057,7 @@ export type SignedTag = { payload: Buffer; signature: string; commit: string; da
 // A tag object's raw bytes, as `git cat-file tag` gives them: exact, as the
 // signature covers every byte.
 export function gitBytes(cwd: string, args: string[]): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    execFile('git', ['-C', cwd, ...args], { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }, (err, stdout, stderr) => {
-      if (err) reject(new Error(`git ${args.join(' ')} failed: ${String(stderr).trim() || err.message}`));
-      else resolve(stdout);
-    });
-  });
+  return runGit(cwd, args, {});
 }
 
 const SSH_BEGIN = '-----BEGIN SSH SIGNATURE-----\n';
@@ -692,7 +1096,7 @@ export function splitSignedTag(raw: Buffer, tag: string): SignedTag | undefined 
 // Whether ssh-keygen finds the signature good for the `git` namespace, by a
 // key in the pinned allowed-signers file (what `git verify-tag` does for an
 // SSH signature, without git choosing the verifier).
-async function sshVerified(signed: SignedTag, signers: string): Promise<boolean> {
+async function sshVerified(signed: SignedTag, signers: string, revoked?: string): Promise<boolean> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-release-sig-'));
   try {
     const sig = path.join(dir, 'tag.sig');
@@ -700,7 +1104,9 @@ async function sshVerified(signed: SignedTag, signers: string): Promise<boolean>
     const found = await run('ssh-keygen', ['-Y', 'find-principals', '-f', signers, '-s', sig]);
     if (found.code !== 0) return false;
     for (const principal of found.stdout.split('\n').map((l) => l.trim()).filter(Boolean)) {
-      const v = await run('ssh-keygen', ['-Y', 'verify', '-f', signers, '-I', principal, '-n', 'git', '-s', sig], signed.payload);
+      // A revoked key is refused even if it were still in the pinned file.
+      const r = revoked && fs.existsSync(revoked) && fs.statSync(revoked).size > 0 ? ['-r', revoked] : [];
+      const v = await run('ssh-keygen', ['-Y', 'verify', '-f', signers, '-I', principal, '-n', 'git', '-s', sig, ...r], signed.payload);
       if (v.code === 0) return true;
     }
     return false;

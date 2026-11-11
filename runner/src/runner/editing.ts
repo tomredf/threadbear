@@ -2,6 +2,7 @@
 // Part of the Runner (runner.ts), split out on 4 Nov 2026 as a plain move so a
 // fork's change to one area doesn't clash with another's. Each method's `this`
 // is the Runner; runner.ts puts them on its prototype.
+import { INSTRUCTIONS_REWOUND } from '../instructions.ts';
 import type { Runner } from '../runner.ts';
 import type { RunnerPart } from './part.ts';
 import type { Account, ImageRef, RewoundFiles } from '../protocol.ts';
@@ -12,7 +13,8 @@ import { cutOut } from '../store.ts';
 import { appliedChanges, undoChanges } from '../undo-edits.ts';
 import crypto from 'node:crypto';
 import type { ThreadState } from '../runner.ts';
-import { checkImages, providerName } from '../runner.ts';
+import { checkImages } from '../runner.ts';
+import { providerName } from '../providers.ts';
 
 export const editingPart = {
   // Mike changes one of his earlier messages and carries on from there
@@ -89,6 +91,10 @@ export const editingPart = {
         delete rec.resumeAt;
         if (!rec.handoff && this.saidBefore(rec, seq)) rec.handoff = { fromCwd: rec.cwd, fromAccountId: rec.accountId };
       } else if (cut.resumeAt) rec.resumeAt = cut.resumeAt;
+      // The kept context breakdown counted the turns just cut (Codex review).
+      delete rec.contextUsage;
+      // The cut may undo what the session was told about them (Codex review).
+      if (!cut.fresh && rec.instructionsTold !== undefined) rec.instructionsTold = INSTRUCTIONS_REWOUND;
       (rec.rewinds ??= []).push({ from: seq, to: toSeq });
       const ev = this.emit(st, { type: 'thread.rewound', fromSeq: seq, toSeq, files });
       // What the cut turns left open or found goes with them (pins stay).

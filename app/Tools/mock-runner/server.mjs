@@ -292,10 +292,15 @@ const devices = [
   { id: 'tok3', kind: 'browser', name: 'Safari', createdAt: '2026-07-01T08:00:00.000Z', expiresAt: '2026-09-29T08:00:00.000Z', expired: true },
 ];
 let deviceSeq = devices.length;
-const deviceList = () => ({ devices: [...devices], site: DEMO_SITE });
+// MOCK_LOCAL_ONLY=1: a backend on this Mac only (setup --self-hosted
+// --local, docs/self-hosting.md), so Settings › Phone & browser can be seen
+// saying why a phone can't pair.
+const LOCAL_ONLY = process.env.MOCK_LOCAL_ONLY === '1';
+const deviceList = () => ({ devices: [...devices], site: LOCAL_ONLY ? 'http://127.0.0.1:13211' : DEMO_SITE });
 
+let mockInstructions = { text: '' };
 const settings = {
-  defaultCwd: defaults.cwd, idleMinutes: 30, maxLiveCLIs: 6, followMain: true, bulletReplies: true, oneReply: true,
+  defaultCwd: defaults.cwd, idleMinutes: 30, maxLiveCLIs: 6, followMain: true, bulletReplies: true, oneReply: true, labReview: true, keepAwake: true,
   models: {
     pool: 'claude',
     privateFolders: ['~/dev/clients/acme'],
@@ -328,6 +333,18 @@ const runners = [SELF_RUNNER, { id: 'runner_bruce', name: 'bruce', icon: 'macmin
 // runner hears of them through remoteThreads.list and remoteThreads.updated,
 // as the real runner passes on what the backend has.
 const BRUCE = 'runner_bruce';
+// Mike's runner order (backend API 58), every runner's id: set with
+// runners.setOrder and said back in remoteThreads.updated, as the real
+// runner passes on the backend's.
+// MOCK_MORE_RUNNERS=1 adds two more, for a list worth rearranging (only for
+// a look at Settings > Runners: the usual demo stays at two).
+// What threads.movePreview says won't come; empty and Move to skips the sheet.
+let moveLeftBehind = ['1 background job, which gets stopped'];
+const MORE_RUNNERS = process.env.MOCK_MORE_RUNNERS ? [
+  { id: 'runner_cloud', name: 'Hetzner Cloud', icon: 'cloud', online: true, lastSeenAt: new Date().toISOString() },
+  { id: 'runner_pixel', name: 'Pixel', icon: 'smartphone', online: true, lastSeenAt: new Date().toISOString() },
+] : [];
+let runnerOrder = ['runner_mock', BRUCE, ...MORE_RUNNERS.map((r) => r.id)];
 // Files on bruce's Mac that its threads name, for files.read from
 // /bruce/rpc (docs/protocol.md, "Other runners' threads"): the picture is a
 // real PNG, the rest text. None of these paths exist on this Mac.
@@ -337,7 +354,17 @@ const BRUCE_FILES = {
   blob: '/Users/bruce/Library/Application Support/Threadbear/threads/bruce_media/blobs/bruce_media_c0_0.txt',
 };
 const bruceModifiedAt = new Date(Date.now() - 3600_000).toISOString();
-addRemoteDemo();
+if (!process.env.TB_MOCK_NO_REMOTE) addRemoteDemo();
+// One demo thread that has sat for three days with a librarian's recap, for
+// the recap box. Only when asked: it would move the thread down every list.
+if (process.env.TB_MOCK_QUIET) {
+  for (const s of threads.values()) {
+    const summary = s.summary ?? s;
+    if (summary.title !== 'Ship the beta to TestFlight') continue;
+    summary.lastActivityAt = new Date(Date.now() - 72 * 3_600_000).toISOString();
+    summary.recap = "Gets the first beta out to testers.\n- The build is uploaded and processing\n- Waiting on you to accept the agreement";
+  }
+}
 /** The schedules (docs/protocol.md, "Schedules"), soonest first. */
 let schedules = [];
 addDemoSchedules();
@@ -358,6 +385,10 @@ let connectors = {
   ],
 };
 addDemoProjects();
+// Decisions on the Projects page (the projectDecisions experiment): three of
+// Threadbear's threads waiting on a card of asks, with what they're for. Only
+// when asked, as it changes those threads' rows and the Projects page.
+if (process.env.TB_MOCK_DECISIONS) addDemoDecisions();
 
 const token = crypto.randomBytes(24).toString('hex');
 fs.mkdirSync(path.join(dataDir, 'secrets'), { recursive: true });
@@ -460,14 +491,27 @@ function onConnection(ws, request) {
 
 async function handle(client, { id, method, params = {} }) {
   // Each runner knows only its own threads: asking this one about one of
-  // bruce's (or bruce about this one's) is "Thread not found".
+  // bruce's (or bruce about this one's) is "Thread not found"...
+  let caller = client;
   if (typeof params?.threadId === 'string' && threads.has(params.threadId) && ownerOf(params.threadId) !== client.as) {
-    return reply(client, id, null, { code: -32004, message: 'Thread not found' });
+    // ...except that this runner answers for bruce's threads through the
+    // backend (docs/protocol.md, "Other runners' threads through the
+    // backend"), the app's default way in: here, that's bruce's own code
+    // answering, on the same connection and with the same shapes. Events
+    // come to whoever subscribed, whichever runner's connection they used.
+    if (client.as !== null || ownerOf(params.threadId) !== BRUCE) {
+      return reply(client, id, null, { code: -32004, message: 'Thread not found' });
+    }
+    caller = { ...client, as: BRUCE };
+  }
+  if (method === 'threads.create' && params?.runnerId === BRUCE && client.as === null) {
+    // A new thread on bruce through this runner, as the relay files it.
+    caller = { ...client, as: BRUCE };
   }
   if (slow.ms > 0 && ['threads.send', 'threads.create', 'threads.update'].includes(method)) {
     await new Promise((resolve) => setTimeout(resolve, slow.ms));
   }
-  const result = await dispatch(client, method, params);
+  const result = await dispatch(caller, method, params);
   if (id !== undefined && id !== null) reply(client, id, result ?? {});
   // Like the real runner: a client that says hello hears about a restart
   // that's waiting, straight after the hello result.
@@ -490,8 +534,42 @@ async function dispatch(client, method, p) {
       }
       return {
         runnerVersion, protocol: 1, accounts: publicAccounts(),
-        defaults: oldRunner ? { ...defaults, poolId: undefined } : defaults, ...(oldRunner ? {} : { clis, updates, pools }),
+        defaults: oldRunner ? { ...defaults, poolId: undefined } : defaults, ...(oldRunner ? {} : { clis, updates, pools, experiments: ['moveToRunner', ...(process.env.TB_MOCK_DECISIONS ? ['projectDecisions'] : [])] }),
       };
+    // Moving a thread to another runner (docs/protocol.md): a guess from
+    // "that runner", and a move that only marks the row, for the app's
+    // Move to menu and sheet.
+    case 'threads.movePreview': {
+      await sleep(500);
+      const runner = runners.concat(MORE_RUNNERS).find((r) => r.id === p.runnerId);
+      const home = runner?.name === 'bruce' ? '/Users/bruce' : '/home/mike';
+      return {
+        cwd: p.cwd || `${home}/dev/me/threadbear-threads/slot-4`,
+        accountId: p.accountId || 'claude-main',
+        accounts: [{ id: 'claude-main', provider: 'claude', title: 'Claude', email: 'mike@example.com' }, { id: 'claude-1', provider: 'claude', title: 'Claude', email: 'mike@work.example.com' }],
+        leftBehind: moveLeftBehind,
+        sourceChecked: true,
+        problems: p.cwd && !String(p.cwd).startsWith(home) ? [`There's no folder ${p.cwd} on ${runner?.name ?? 'it'}.`] : [],
+        worktree: true,
+      };
+    }
+    case 'threads.move': {
+      const t = threads.get(p.threadId);
+      const runner = runners.concat(MORE_RUNNERS).find((r) => r.id === p.runnerId);
+      if (t) {
+        t.summary.moving = { moveId: 'mock-move', to: p.runnerId, toName: runner?.name ?? p.runnerId, state: 'ready' };
+        broadcastSummary(p.threadId);
+      }
+      return { moveId: 'mock-move' };
+    }
+    case 'threads.moveCancel': {
+      const t = threads.get(p.threadId);
+      if (t?.summary.moving) {
+        t.summary.moving = { ...t.summary.moving, state: 'cancelled' };
+        broadcastSummary(p.threadId);
+      }
+      return {};
+    }
     case 'files.read':
       // Slow enough on bruce that the app's loading state shows.
       if (client.as) await sleep(400);
@@ -522,7 +600,7 @@ async function dispatch(client, method, p) {
       if (!oldRunner) status.clis = clis;
       // Sync on, to the made-up deployment, so the website's links and
       // sharing show (their links open nothing).
-      if (!oldRunner) status.sync = { state: 'ok', url: DEMO_DEPLOYMENT };
+      if (!oldRunner) status.sync = LOCAL_ONLY ? { state: 'ok', url: 'http://127.0.0.1:13210', site: 'http://127.0.0.1:13211', pushOff: true } : { state: 'ok', url: DEMO_DEPLOYMENT };
       return status;
     }
     // The CLI requests only report and pretend: nothing is checked or
@@ -612,6 +690,8 @@ async function dispatch(client, method, p) {
     }
     case 'threads.create': {
       if (!p.text) throw rpcError(-32602, 'text is required');
+      // New Thread on a project's page: every project checked first, as the runner does.
+      const startIn = (p.projectIds ?? []).map((id) => needProject(id));
       const threadId = 'th_' + crypto.randomBytes(6).toString('hex');
       const now = iso();
       // Like the runner: a login named pins the thread; otherwise a pool
@@ -633,7 +713,9 @@ async function dispatch(client, method, p) {
       // `fresh`: started this session, so the librarian files it after its first turn
       // (librarianFiles). The demo fixtures never are, so nothing they show changes.
       threads.set(threadId, { summary, events: [], inProgress: new Map(), timers: [], fresh: true, ...(client.as ? { runnerId: client.as } : {}) });
+      for (const project of startIn) join(summary, project, 'mike', true);
       broadcastSummary(threadId);
+      if (startIn.length) broadcastProjects();
       setTimeout(() => fakeTurn(threadId, p.text, p.images ?? []), 10);
       return { thread: summary };
     }
@@ -675,6 +757,13 @@ async function dispatch(client, method, p) {
       const turnId = 'turn_' + crypto.randomBytes(4).toString('hex');
       setTimeout(() => fakeTurn(t.summary.id, p.text ?? '', p.images ?? [], turnId, undefined, { editOf: p.seq }), 10);
       return { turnId, rewound: { seq: rewound.seq, fromSeq: rewound.fromSeq, toSeq: rewound.toSeq, files } };
+    }
+    case 'threads.delete': {
+      const t = need(p.threadId);
+      if (t.interrupt) t.interrupt();
+      threads.delete(t.summary.id);
+      broadcast('thread.deleted', { threadId: t.summary.id });
+      return {};
     }
     case 'threads.interrupt': {
       const t = need(p.threadId);
@@ -798,6 +887,57 @@ async function dispatch(client, method, p) {
       delete t.summary.woke;
       broadcastSummary(t.summary.id);
       return { thread: t.summary };
+    }
+    case 'buttons.list': {
+      // docs/protocol.md, "Reply buttons": every button the thread has.
+      const t = need(p.threadId);
+      return { buttons: [...(t.buttons?.values() ?? [])].map((button) => structuredClone(button)) };
+    }
+    case 'buttons.press': {
+      // Starts the thread or sends the message once, like the runner. It
+      // takes a moment (longer under mock.slow), and a button whose folder
+      // is "/gone" fails, so the app's pressing and failed pills can be seen.
+      const t = need(p.threadId);
+      const button = t.buttons?.get(p.buttonId);
+      if (!button) throw rpcError(-32602, `Button not found: ${p.buttonId}`);
+      if (button.pressed || button.running) return { button: structuredClone(button) };
+      if (button.run) {
+        // Answers at once, running, then finishes, as the runner does.
+        const { failed: _failed, ...rest } = button;
+        const running = { ...rest, running: { at: iso() } };
+        t.buttons.set(running.id, running);
+        persist(t.summary.id, { type: 'button.updated', button: running });
+        setTimeout(() => {
+          const { running: _going, ...left } = running;
+          const done = { ...left, pressed: { at: iso(), threadId: t.summary.id }, ran: { ok: true, exitCode: 0, durationMs: 1500 } };
+          t.buttons.set(done.id, done);
+          persist(t.summary.id, { type: 'button.updated', button: done });
+        }, 1500 + slow.queueMs);
+        return { button: structuredClone(running) };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 600 + slow.queueMs));
+      const from = `[Sent by the agent in the thread "${t.summary.title}" (${t.summary.id.slice(0, 8)})]\n\n`;
+      let next;
+      try {
+        if (button.start?.cwd === '/gone') throw rpcError(-32602, 'Folder not found: /gone');
+        if (button.start) {
+          const made = await dispatch(client, 'threads.create', { text: from + button.start.text, title: button.start.title ?? button.title, cwd: button.start.cwd, permissionMode: button.start.permissionMode });
+          next = { ...button, pressed: { at: iso(), threadId: made.thread.id } };
+        } else {
+          need(button.send.threadId);
+          await dispatch(client, 'threads.send', { threadId: button.send.threadId, text: from + button.send.text });
+          next = { ...button, pressed: { at: iso(), threadId: button.send.threadId } };
+        }
+        delete next.failed;
+      } catch (e) {
+        const failed = { ...button, failed: { at: iso(), error: String(e.message ?? e).slice(0, 300) } };
+        t.buttons.set(failed.id, failed);
+        persist(t.summary.id, { type: 'button.updated', button: failed });
+        throw e;
+      }
+      t.buttons.set(next.id, next);
+      persist(t.summary.id, { type: 'button.updated', button: next });
+      return { button: structuredClone(next) };
     }
     case 'reviews.list': {
       const t = need(p.threadId);
@@ -989,10 +1129,49 @@ async function dispatch(client, method, p) {
       if (p.question) return { answer: `About "${sel}": ${p.question} That's the mock runner's answer to a follow-up.`, model: 'mock' };
       return { answer: `**${sel}** is what the agent called this step. It means the smallest piece to move first, so the rest can follow.\n\n- It's in \`runner/src/explain.ts\`\n- Nothing here goes into the thread`, model: 'mock' };
     }
+    case 'threads.contextUsage': {
+      // What fills the context (docs/protocol.md, "Context breakdown"), the
+      // rows Ghostex showed on 9 Nov, scaled to the thread's own total. A
+      // moment's wait, like the CLI's count; Codex threads have none.
+      const t = need(p.threadId);
+      if (t.summary.provider === 'codex' || !t.summary.contextTokens) return { live: false };
+      await new Promise((r) => setTimeout(r, 700));
+      const max = t.summary.contextWindow ?? 1_000_000;
+      const fixed = { system_prompt: 4_500, system_tools: 2_300, mcp_instructions: 596, mcp_tools: 1_700, memory_files: 15_000, skills: 8_100 };
+      const messages = Math.max(0, t.summary.contextTokens - Object.values(fixed).reduce((a, b) => a + b, 0));
+      const buffer = 33_000;
+      const used = messages + Object.values(fixed).reduce((a, b) => a + b, 0);
+      const row = (id, name, tokens, kind = 'used') => ({ id, name, tokens, kind });
+      return {
+        live: true,
+        usage: {
+          at: new Date().toISOString(),
+          model: 'claude-opus-5-5',
+          totalTokens: used,
+          maxTokens: max,
+          categories: [
+            row('system_prompt', 'System prompt', fixed.system_prompt),
+            row('system_tools', 'System tools', fixed.system_tools),
+            row('mcp_instructions', 'MCP server instructions', fixed.mcp_instructions),
+            row('mcp_tools', 'MCP tools', fixed.mcp_tools),
+            row('mcp_tools_deferred', 'MCP tools (deferred)', 173_000, 'deferred'),
+            row('system_tools_deferred', 'System tools (deferred)', 16_000, 'deferred'),
+            row('memory_files', 'Memory files', fixed.memory_files),
+            row('skills', 'Skills', fixed.skills),
+            row('messages', 'Messages', messages),
+            row('autocompact_buffer', 'Autocompact buffer', buffer, 'buffer'),
+            row('free_space', 'Free space', Math.max(0, max - used - buffer), 'free'),
+          ],
+        },
+      };
+    }
+    case 'folders.commands':
     case 'threads.commands': {
       // The palette's list (docs/protocol.md, "Slash commands"): Threadbear's
       // own, the CLI's, then skills, as a real Claude thread lists them.
-      const t = need(p.threadId);
+      // folders.commands is a new thread's box asking before there's a
+      // thread: the same list for the folder it would start in.
+      const t = method === 'folders.commands' ? { summary: { provider: 'claude', cwd: p.cwd ?? os.homedir() } } : need(p.threadId);
       const codex = t.summary.provider === 'codex';
       const own = [
         { name: 'model', description: "Switch this thread's model", argumentHint: '[model]', source: 'threadbear' },
@@ -1015,7 +1194,7 @@ async function dispatch(client, method, p) {
           ];
       const skills = [
         { name: 'code-review', description: 'Review the current diff, or a PR number, branch or path, for correctness bugs, at the effort level given first.', argumentHint: '[low|medium|high] [target]', source: 'skill', scope: 'user', path: `${os.homedir()}/.claude/skills/code-review/SKILL.md` },
-        { name: 'computercub', description: "Drive Mac apps and the parts of Chrome extensions can't reach.", source: 'skill' },
+        { name: 'computercub', description: "Drive Mac apps and the parts of Chrome extensions can't reach, with the `computercub` command.", source: 'skill' },
         { name: 'cloudflare', description: 'Cloudflare platform: Workers, Pages, KV, D1, R2 and the rest.', source: 'skill' },
         { name: 'claude-api', description: 'Model ids, pricing, params and the Anthropic SDK.', source: 'skill' },
         { name: 'deslop', description: 'A second-pass cleanup over AI-written code using the repo style guide.', source: 'skill', scope: 'project', path: `${t.summary.cwd}/.claude/skills/deslop/SKILL.md` },
@@ -1048,9 +1227,11 @@ async function dispatch(client, method, p) {
       list.highlights = list.highlights.filter((h) => h.id !== id);
       list.highlights.unshift({
         id, kind, title: p.title ?? (p.path ? path.basename(p.path) : p.url), path: p.path, url: p.url, how: 'pinned',
-        note: p.note, ...(p.show ? { show: true } : {}), seq: t.summary.lastSeq, lastSeq: t.summary.lastSeq, at: iso(),
+        note: p.note, seq: t.summary.lastSeq, lastSeq: t.summary.lastSeq, at: iso(),
       });
       t.summary.highlightsAt = iso();
+      // show is a panel request naming the pin, as the runner's (docs/protocol.md, "Highlights").
+      if (p.show) t.summary.panelRequest = { id: 'pr_' + crypto.randomBytes(4).toString('hex'), panel: 'highlights', title: list.highlights[0].title, highlight: id, at: iso() };
       broadcastSummary(t.summary.id);
       return { highlight: list.highlights[0] };
     }
@@ -1095,6 +1276,20 @@ async function dispatch(client, method, p) {
     case 'remoteThreads.list':
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       return remoteThreads(client);
+    case 'remoteThreads.logins': {
+      // That runner's logins through this one, from the backend (no pools,
+      // and its default folder), as bruce's own hello has them.
+      if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
+      if (p.runnerId !== BRUCE) throw rpcError(-32000, `No logins known for ${p.runnerId}`);
+      return { accounts: publicAccounts().filter((a) => a.id === 'claude-main' || a.id === 'codex-main'), pools: [], defaults: { ...defaults, poolId: undefined, accountId: 'claude-main', cwd: '/Users/bruce/dev/me/misc' } };
+    }
+    case 'runners.setOrder': {
+      if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
+      if (!Array.isArray(p.runnerIds) || !p.runnerIds.every((x) => typeof x === 'string')) throw rpcError(-32602, 'runnerIds must be a list of runner ids');
+      runnerOrder = [...new Set(p.runnerIds)];
+      for (const c of clients) if (c.authed && c.as === null) send(c, 'remoteThreads.updated', remoteThreads(c));
+      return {};
+    }
     case 'runners.list':
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       // With what each one's heartbeat says, for the Runners panel: bruce
@@ -1105,7 +1300,8 @@ async function dispatch(client, method, p) {
           ...(r.self
             ? { version: '0.1.0+20261105T064853Z-c4d90ca', release: '20261105T064853Z-c4d90ca', startedAt: iso(-16 * 60_000) }
             : { version: '0.1.0+20261104T221010Z-51ae514', release: '20261104T221010Z-51ae514', startedAt: iso(-26 * 3_600_000) }),
-        })),
+        })).concat(MORE_RUNNERS.map((r) => ({ id: r.id, name: r.name, icon: r.icon, online: true, lastSeenAt: iso(), self: false,
+          version: '0.1.0+20261104T221010Z-51ae514', release: '20261104T221010Z-51ae514', startedAt: iso(-3 * 3_600_000) }))),
       };
     case 'runners.stats': {
       // Each runner's machine figures, a little different each ask.
@@ -1202,6 +1398,12 @@ async function dispatch(client, method, p) {
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       if (p.refresh) connectors = { ...connectors, checkedAt: iso() };
       return { connectors };
+    case 'instructions.get':
+      return { instructions: mockInstructions };
+    case 'instructions.set':
+      mockInstructions = { text: p.text.trim() ? p.text.trim() + '\n' : '' };
+      broadcast('instructions.updated', { instructions: mockInstructions });
+      return { instructions: mockInstructions };
     case 'settings.get':
       return { settings };
     case 'settings.update': {
@@ -1220,6 +1422,8 @@ async function dispatch(client, method, p) {
       }
       if (p.followMain !== undefined) settings.followMain = Boolean(p.followMain);
       if (p.bulletReplies !== undefined) settings.bulletReplies = Boolean(p.bulletReplies);
+      if (p.labReview !== undefined) settings.labReview = Boolean(p.labReview);
+      if (p.keepAwake !== undefined) settings.keepAwake = Boolean(p.keepAwake);
       const m = p.models ?? {};
       if (m.pool !== undefined) {
         if (m.pool !== null && !poolOf(m.pool)) throw rpcError(-32602, `No pool called ${m.pool}`);
@@ -1241,6 +1445,7 @@ async function dispatch(client, method, p) {
     case 'devices.pair': {
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       if (!['phone', 'browser'].includes(p.kind)) throw rpcError(-32602, 'kind must be one of phone, browser');
+      if (LOCAL_ONLY && p.kind === 'phone') throw rpcError(-32000, "Your backend is on this Mac only (setup --self-hosted --local), so a phone can't reach it.");
       const name = typeof p.name === 'string' && p.name.trim() ? p.name.trim() : p.kind === 'phone' ? 'iPhone' : 'Browser';
       const days = p.days ?? 90;
       const device = { id: `tok${++deviceSeq}`, kind: p.kind, name, createdAt: iso(), expiresAt: new Date(Date.now() + days * 86_400_000).toISOString(), expired: false };
@@ -1258,6 +1463,9 @@ async function dispatch(client, method, p) {
       return deviceList();
     }
     // Mock-only helpers for perf runs, demos and screenshots.
+    case 'mock.moveLeftBehind':
+      moveLeftBehind = p.lines ?? [];
+      return { lines: moveLeftBehind };
     case 'mock.slow': {
       slow = { ms: Math.max(0, Number(p.ms ?? 0)), queueMs: Math.max(0, Number(p.queueMs ?? 0)) };
       return slow;
@@ -1310,6 +1518,24 @@ async function dispatch(client, method, p) {
       }
       broadcast('runner.updates', { updates });
       return { updates };
+    }
+    case 'mock.fillArchived': {
+      // More archived threads than the Archived section shows at first, for
+      // its Show more row: `count` of them, each archived a minute apart.
+      const count = Number(p.count) || 30;
+      const now = Date.now();
+      for (let i = 0; i < count; i++) {
+        const id = `th_archived_${i}`;
+        const ts = new Date(now - (i + 1) * 60_000 - 3_600_000).toISOString();
+        const summary = {
+          id, title: `Archived thread ${i + 1}`, cwd: defaults.cwd, accountId: 'claude-main', provider: 'claude',
+          permissionMode: 'full', status: 'idle', live: false, needsYou: false, createdAt: ts, updatedAt: ts, lastActivityAt: ts,
+          archivedAt: ts, preview: '', lastSeq: 0, lastSeenSeq: 0,
+        };
+        threads.set(id, { summary, events: [], inProgress: new Map(), timers: [] });
+        broadcastSummary(id);
+      }
+      return { count };
     }
     case 'mock.background': {
       // What a thread's CLI is running in the background, as the real
@@ -1397,6 +1623,32 @@ async function fakeTurn(threadId, text, images, turnId = 'turn_' + crypto.random
 
   const thinkId = 'r_' + crypto.randomBytes(4).toString('hex');
   persist(threadId, { type: 'reasoning', itemId: thinkId, text: 'Checking what the message asks for before answering.' }, turnId);
+
+  // "queued" in a message: an edit's card with the reply's other calls
+  // queued on it (docs/protocol.md, "Queued calls").
+  if (/queued/i.test(text)) {
+    const approvalId = 'ap_' + crypto.randomBytes(4).toString('hex');
+    const root = t.summary.cwd || '/Users/mike/dev/photo-sync';
+    const edit = (id, file, oldText, newText) => ({ itemId: id, name: 'Edit', title: `Edit ${file}`, input: { file_path: `${root}/${file}`, old_string: oldText, new_string: newText } });
+    const head = edit('q1', 'Tests/PreviewTests.swift', '        let started = Date()\n        _ = Preview.references(in: text)\n        XCTAssertLessThan(Date().timeIntervalSince(started), 10)', '        let seconds = cpuSeconds {\n            _ = Preview.references(in: text)\n        }\n        XCTAssertLessThan(seconds, 30)');
+    const calls = [
+      edit('q2', 'Tests/DraftTests.swift', '        let start = Date()', '        let seconds = cpuSeconds {\n            _ = Draft.parse(text)\n        }'),
+      { itemId: 'q3', name: 'Write', title: 'Write Tests/CPUTime.swift', input: { file_path: `${root}/Tests/CPUTime.swift`, content: 'import Darwin\n\n/// CPU time the block took, not wall time: a loaded machine\n/// doesn\'t fail the test.\nfunc cpuSeconds(_ body: () -> Void) -> Double {\n    let before = clock()\n    body()\n    return Double(clock() - before) / Double(CLOCKS_PER_SEC)\n}\n' } },
+      { itemId: 'q4', name: 'Bash', title: 'swift test --filter PreviewTests', input: { command: 'swift test --filter PreviewTests' } },
+    ];
+    for (const c of [head, ...calls]) persist(threadId, { type: 'tool.call', itemId: c.itemId, name: c.name, kind: c.name === 'Bash' ? 'command' : 'edit', title: c.title, input: c.input }, turnId);
+    persist(threadId, { type: 'approval.requested', approvalId, itemId: head.itemId, name: head.name, title: head.title, input: head.input, options: ['allow', 'allowAlways', 'deny'] }, turnId);
+    persist(threadId, { type: 'approval.queued', approvalId, calls }, turnId);
+    setStatus(threadId, 'waiting', true);
+    t.approvalWaiters ??= new Map();
+    const answer = await new Promise((resolve) => t.approvalWaiters.set(approvalId, resolve));
+    setStatus(threadId, 'running', false);
+    const answers = { [head.itemId]: answer.decision, ...(answer.queued ?? {}) };
+    for (const c of [head, ...calls]) persist(threadId, { type: 'tool.result', itemId: c.itemId, ok: answers[c.itemId] === 'allow', text: answers[c.itemId] === 'allow' ? 'Done.' : 'The user denied this.', truncated: false, images: [] }, turnId);
+    const allowed = Object.values(answers).filter((d) => d === 'allow').length;
+    persist(threadId, { type: 'assistant.text', itemId: 'm_' + crypto.randomBytes(4).toString('hex'), text: `Allowed ${allowed} of ${calls.length + 1}.` }, turnId);
+    return finishTurn(threadId, turnId, started, 'completed');
+  }
 
   if (/approval|ask me/i.test(text) || t.summary.permissionMode === 'ask') {
     const approvalId = 'ap_' + crypto.randomBytes(4).toString('hex');
@@ -1913,8 +2165,9 @@ function remoteThreads(client) {
     runners: [{
       id: BRUCE, name: bruce.name, icon: bruce.icon, online: true, lastSeenAt: iso(),
       rpcUrl: `ws://127.0.0.1:${port}/bruce/rpc`, tokenFile: path.join(dataDir, `secrets/runners/${BRUCE}.token`),
-    }],
+    }, ...MORE_RUNNERS],
     threads: rows,
+    order: runnerOrder,
   };
 }
 
@@ -1933,7 +2186,7 @@ function bruceFile(file) {
 // files.read as the runner answers it (runner/src/files.ts): bruce's made-up
 // files for bruce's clients, real ones on this Mac for this runner's.
 function readFile(client, p) {
-  if (typeof p.path !== 'string' || !p.path.startsWith('/')) throw rpcError(-32602, `path must be absolute: ${p.path}`);
+  if (typeof p.path !== 'string' || !path.isAbsolute(p.path)) throw rpcError(-32602, `path must be absolute: ${p.path}`);
   let bytes;
   let modifiedAt;
   if (client.as === BRUCE) {
@@ -1965,7 +2218,7 @@ function readFile(client, p) {
 // folder for bruce's clients (each of bruce's files' folders holds it),
 // the real one on this Mac for this runner's.
 function listFolder(client, p) {
-  if (typeof p.path !== 'string' || !p.path.startsWith('/')) throw rpcError(-32602, `path must be absolute: ${p.path}`);
+  if (typeof p.path !== 'string' || !path.isAbsolute(p.path)) throw rpcError(-32602, `path must be absolute: ${p.path}`);
   if (client.as === BRUCE) {
     const files = Object.values(BRUCE_FILES);
     const within = files.filter((f) => f.startsWith(`${p.path.replace(/\/$/, '')}/`)).map((f) => f.slice(p.path.replace(/\/$/, '').length + 1));
@@ -2066,7 +2319,9 @@ function scheduleWake(threadId) {
       s.snoozedUntil = undefined;
       delete s.wakeWhen;
       s.needsYou = true;
-      // As the runner does: "Woke up" on the row until it's opened.
+      // As the runner does: a note in the thread, and "Woke up" on the row
+      // until it's opened.
+      persist(threadId, { type: 'system.note', text: 'Woke up from hibernating.' });
       s.woke = { at: iso(), ...(s.snoozedAt ? { since: s.snoozedAt } : {}) };
       delete s.snoozedAt;
       broadcastSummary(threadId);
@@ -2431,6 +2686,46 @@ function listedProjects(archived) {
 
 function membersOf(projectId) {
   return [...threads.values()].map((t) => t.summary).filter((s) => s.projects?.some((x) => x.id === projectId));
+}
+
+/**
+ * TB_MOCK_DECISIONS: cards of asks on three of the Threadbear project's idle
+ * threads, as one-reply cards (options with what each does, the agent's pick),
+ * each with the librarian's recap, for the projectDecisions experiment's
+ * Decisions section (features/projects.feature, its screenshots).
+ */
+function addDemoDecisions() {
+  const cards = {
+    demo_settings_tabs: {
+      minutesAgo: 35, recap: 'Renames the Settings tabs in the Mac app so each says what it holds.\n- General, Accounts and Advanced renamed',
+      asks: [{ action: 'Call the Advanced tab "Machine" or "Runner"?', why: 'It holds the runner\'s folder, the check hosts and the logs.',
+        options: ['Runner', 'Machine'], optionNotes: ['Matches the runner menu', ''], suggested: 0 }],
+    },
+    demo_sqlite_vs_files: {
+      minutesAgo: 60, recap: 'Weighs SQLite against plain files for the runner\'s thread store.\n- Benchmarks done: files win under 10k threads',
+      asks: [{ action: 'Keep plain files for now?', why: 'Files were faster for every size we have. SQLite only wins past about 10,000 threads.',
+        options: ['Keep files', 'Move to SQLite'], optionNotes: ['Revisit at 5,000 threads', 'About two days of work'], suggested: 0 }],
+    },
+    demo_release_notes: {
+      minutesAgo: 180, recap: 'Drafts the release notes for 0.4 from this week\'s commits.\n- Draft written',
+      asks: [
+        { action: 'Lead with projects or with the librarian?', options: ['Projects', 'The librarian'], suggested: 0 },
+        { action: 'Mention the Windows build?', why: 'It runs, but nobody outside has tried it yet.', options: ['Not yet', 'As a preview'], suggested: 0 },
+      ],
+    },
+  };
+  for (const [id, card] of Object.entries(cards)) {
+    const t = threads.get(id);
+    if (!t) continue;
+    const done = t.events.findLast((e) => e.type === 'turn.completed');
+    if (done) Object.assign(done, { needs: 'you', asks: card.asks });
+    Object.assign(t.summary, {
+      status: 'idle', needs: 'you', needsYou: true, asks: card.asks, asksSeq: done?.seq ?? t.summary.lastSeq, recap: card.recap,
+      lastActivityAt: new Date(Date.now() - card.minutesAgo * 60_000).toISOString(),
+    });
+    // Waiting on Mike, not on a login with room.
+    delete t.summary.waitingForRoom;
+  }
 }
 
 function join(summary, project, by, pinned, at = iso(), why) {
@@ -2799,6 +3094,7 @@ The new hero is shorter, and every page now leads with what the app does.
 `);
     const before = file('screens/pricing-before.png', { copy: path.join(here, 'fixtures/demo-upload-resume/media/progress-before.png') });
     file('logs/docs-build.txt', 'Error: Could not resolve image /docs/hero.png\n  at src/pages/docs.astro:12\nBuild failed in 14.2s.\n');
+    file('src/hero.ts', '// The hero at the top of the home page.\nexport function hero(words: string): string {\n  return `<h1>${words}</h1>`;\n}\n');
     site.summary.cwd = root;
     const at = (seq) => site.events.find((e) => e.seq === seq)?.ts ?? iso();
     const h = (seq, fields) => ({ seq, lastSeq: seq, at: at(seq), ...fields });
@@ -2932,7 +3228,9 @@ function loadFixtures() {
       summary.asked ??= events.map(askedLine).findLast(Boolean);
       const reviews = new Map();
       for (const event of events) if (event.type === 'review.updated') reviews.set(event.review.id, event.review);
-      const t = { summary, events, reviews, inProgress: new Map(), timers: [], dir };
+      const buttons = new Map();
+      for (const event of events) if (event.type === 'button.updated') buttons.set(event.button.id, event.button);
+      const t = { summary, events, reviews, buttons, inProgress: new Map(), timers: [], dir };
       updateReviewCount(t);
       loaded.push(t);
     }
