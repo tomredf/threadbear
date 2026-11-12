@@ -281,9 +281,12 @@ test('a landing whose tb is killed during the group check still lands, if its br
   assert.ok(fs.existsSync(path.join(main, 'b.txt')) && fs.existsSync(path.join(main, 'c.txt')), out.out.join('\n'));
   assert.ok(out.out.some((l) => /In the same check, and landed with it: thread\/c0000000/.test(l)));
   // c's branch is on what landed, so its next tb land has nothing to land.
+  // Whether b's landing or this one moves c's branch there depends on when
+  // c's stand-in lets go, so this one may first say it moved it.
   const again = capture();
   assert.equal(await land({ ...c, check: 'true' }, again.opts), 0);
-  assert.deepEqual(again.out, [`Nothing to land: ${c.branch} has no commits that aren't on main.`]);
+  const moved = `An earlier tb land of ${c.branch} landed while its tb was stopped; the branch is moved to what landed.`;
+  assert.deepEqual(again.out.filter((l) => l !== moved), [`Nothing to land: ${c.branch} has no commits that aren't on main.`]);
   assert.equal(sh(main, 'git log --format=%s main | grep -c "Empty on c"'), '1');
 });
 
